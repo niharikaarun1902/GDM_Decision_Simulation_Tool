@@ -9,6 +9,8 @@ Run with:  streamlit run app.py
 """
 
 import os
+import base64
+import io
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -19,6 +21,26 @@ import altair as alt
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FILE_PATH = os.path.join(BASE_DIR, "data.xlsx")
 SALES_VAR_PATH = os.path.join(BASE_DIR, "salesVariability.xlsx")
+
+
+def _load_excel_source(secret_key: str, local_path: str):
+    """Try Streamlit secrets first (base64-encoded), fall back to local file.
+
+    Returns raw bytes when using secrets, or the file path string for local.
+    Wrap the result in io.BytesIO before each pd.read_excel call if bytes.
+    """
+    try:
+        b64 = st.secrets[secret_key]
+        return base64.b64decode(b64)
+    except (KeyError, FileNotFoundError):
+        return local_path
+
+
+def _excel_input(source):
+    """Return a value suitable for pd.read_excel — BytesIO for bytes, path for str."""
+    if isinstance(source, bytes):
+        return io.BytesIO(source)
+    return source
 
 NEEDED_MATURITIES = [85, 95, 105, 115]
 YEARS_NEEDED = list(range(2, 11))
@@ -159,11 +181,12 @@ def _parse_sv_long(sv_raw, header_row, arch_col, year_cols):
 def load_all_data():
     """Load and parse both Excel files. Returns a dict of all derived tables."""
 
-    # -- Load sheets from data.xlsx --
-    conv_tab = pd.read_excel(FILE_PATH, sheet_name="Conversion rates")
-    yield_tab = pd.read_excel(FILE_PATH, sheet_name="Production yields")
-    params_tab = pd.read_excel(FILE_PATH, sheet_name="Product parameters")
-    sales_raw = pd.read_excel(FILE_PATH, sheet_name="Sales volume parameters", header=None)
+    # -- Load sheets from data.xlsx (secrets or local) --
+    data_src = _load_excel_source("DATA_XLSX", FILE_PATH)
+    conv_tab = pd.read_excel(_excel_input(data_src), sheet_name="Conversion rates")
+    yield_tab = pd.read_excel(_excel_input(data_src), sheet_name="Production yields")
+    params_tab = pd.read_excel(_excel_input(data_src), sheet_name="Product parameters")
+    sales_raw = pd.read_excel(_excel_input(data_src), sheet_name="Sales volume parameters", header=None)
 
     for df_ in [conv_tab, yield_tab, params_tab]:
         df_.columns = df_.columns.astype(str).str.strip()
@@ -279,7 +302,8 @@ def load_all_data():
     # -- Sales Variability (lognormal params) --
     # TODO: Row/column indices here are hardcoded to the current salesVariability.xlsx layout.
     #       If that spreadsheet is restructured, these offsets will need updating.
-    sv_raw = pd.read_excel(SALES_VAR_PATH, sheet_name="Sales volume parameters", header=None)
+    sv_src = _load_excel_source("SALES_VAR_XLSX", SALES_VAR_PATH)
+    sv_raw = pd.read_excel(_excel_input(sv_src), sheet_name="Sales volume parameters", header=None)
 
     fy_mat_cols = {85: 1, 95: 2, 105: 3, 115: 4}
     fy_mu_header = 4

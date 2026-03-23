@@ -1,3 +1,8 @@
+# Data files
+data.xlsx
+salesVariability.xlsx
+encode_secrets.py
+
 # Virtual environments
 .venv/
 venv/
