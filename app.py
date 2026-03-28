@@ -21,6 +21,7 @@ import altair as alt
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FILE_PATH = os.path.join(BASE_DIR, "data.xlsx")
 SALES_VAR_PATH = os.path.join(BASE_DIR, "salesVariability.xlsx")
+MODEL_NOTEBOOK = "GDM_final.ipynb"
 
 
 def _load_excel_source(secret_key: str, local_path: str):
@@ -44,6 +45,7 @@ def _excel_input(source):
 
 NEEDED_MATURITIES = [85, 95, 105, 115]
 YEARS_NEEDED = list(range(2, 11))
+LAUNCH_YEARS = list(range(0, 6))
 
 STRATEGY_OPTIONS = {
     "Custom multiplier by year (Y1-Y10)": "custom",
@@ -466,14 +468,16 @@ def get_yearly_multipliers(strategy, custom_sliders):
     return [1.5] * 10
 
 
-def simulate_one_run(data, sales, archetype, rng, mults, k, use_floor, min_floor):
+def simulate_one_run(data, sales, archetype, rng, mults, use_floor, min_floor,
+                     use_max_carry, max_carryover):
     """
     One Monte Carlo lifecycle:
       sales      -- length-10 array (Year 1..10)
       mults      -- 10 production multipliers
-      k          -- carryover stop-rule multiplier (0 = disabled)
       use_floor  -- whether to enforce minimum production floor
       min_floor  -- minimum production floor value
+      use_max_carry -- whether to enforce maximum carryover cap
+      max_carryover -- absolute carry-in inventory cap
     """
     y_draw, c_draw = sample_yield_conv_normal(data, archetype, rng)
 
@@ -486,7 +490,7 @@ def simulate_one_run(data, sales, archetype, rng, mults, k, use_floor, min_floor
 
         planned_prod = mults[yr] * expected_sales_next
 
-        if k > 0 and expected_sales_next > 0 and carryover > k * expected_sales_next:
+        if use_max_carry and max_carryover > 0.0 and carryover >= max_carryover:
             planned_prod = 0.0
 
         if use_floor and planned_prod > 0.0:
@@ -528,7 +532,8 @@ def determine_analysis_year(lifecycle_df, year_mode, custom_year_idx):
 
 
 def build_lifecycle_sim(data, products, iterations, seed, strategy, custom_sliders,
-                        k, use_floor, min_floor, year_mode, custom_year_idx, threshold):
+                        use_floor, min_floor, use_max_carry, max_carryover,
+                        year_mode, custom_year_idx, threshold):
     """
     Full Monte Carlo runner.
 
@@ -556,7 +561,10 @@ def build_lifecycle_sim(data, products, iterations, seed, strategy, custom_slide
         prod_rows = []
         for _ in range(int(iterations)):
             sales = draw_sales_curve(data, arch, maturity, rng)
-            rows, _ = simulate_one_run(data, sales, arch, rng, mults, k, use_floor, min_floor)
+            rows, _ = simulate_one_run(
+                data, sales, arch, rng, mults,
+                use_floor, min_floor, use_max_carry, max_carryover
+            )
             prod_rows.append(rows)
         prod_rows = np.stack(prod_rows, axis=0)
         run_rows_all.append(prod_rows)
@@ -611,10 +619,112 @@ def build_lifecycle_sim(data, products, iterations, seed, strategy, custom_slide
     return lifecycle_df, summary_df, ay_idx, parsed, warnings
 
 
+def build_launch_cohorts(launch_plan_df):
+    """From launch plan table, create (archetype, maturity, launch_year, n_products)."""
+    cohorts = []
+    for _, row in launch_plan_df.iterrows():
+        arch = str(row["Archetype"]).strip()
+        maturity = int(row["Maturity"])
+        for y in LAUNCH_YEARS:
+            n = int(row.get(f"Y{y}", 0) or 0)
+            if n > 0:
+                cohorts.append((arch, maturity, y, n))
+    return cohorts
+
+
+def run_multiyear_launch_sim(data, launch_plan_df, iterations, seed, strategy, custom_sliders,
+                             use_floor, min_floor, use_max_carry, max_carryover, threshold):
+    """Multi-year launch Monte Carlo aggregated over calendar years."""
+    cohorts = build_launch_cohorts(launch_plan_df)
+    if not cohorts:
+        return None, None, None, ["No launches defined. Fill in at least one launch cell > 0."]
+
+    max_launch = max(c[2] for c in cohorts)
+    horizon_years = max_launch + 10
+    rng = np.random.default_rng(int(seed))
+    mults = get_yearly_multipliers(strategy, custom_sliders)
+
+    all_runs = np.zeros((int(iterations), horizon_years, 8), dtype=float)
+    unique_products = sorted({(arch, mat) for (arch, mat, _, _) in cohorts})
+
+    for arch, mat in unique_products:
+        base_runs = []
+        for _ in range(int(iterations)):
+            sales = draw_sales_curve(data, arch, mat, rng)
+            rows, _ = simulate_one_run(
+                data, sales, arch, rng, mults,
+                use_floor, min_floor, use_max_carry, max_carryover
+            )
+            base_runs.append(rows)
+        base_runs = np.stack(base_runs, axis=0)
+
+        prod_all = np.zeros((int(iterations), horizon_years, 8), dtype=float)
+        for _, _, launch_year, n_products in [c for c in cohorts if c[0] == arch and c[1] == mat]:
+            for _ in range(n_products):
+                for it in range(int(iterations)):
+                    rows = base_runs[it, :, :]
+                    start = launch_year
+                    end = min(launch_year + 10, horizon_years)
+                    span = end - start
+                    prod_all[it, start:end, :] += rows[:span, :]
+        all_runs += prod_all
+
+    median_rows = np.median(all_runs, axis=0)
+    year_cols = [f"Year {i}" for i in range(1, horizon_years + 1)]
+    lifecycle_df = pd.DataFrame(
+        median_rows.T,
+        columns=year_cols,
+        index=[
+            "Carry-in inventory (from prior year)",
+            "Carry-in quality loss (10%)",
+            "Planned production",
+            "Actual production (after yield & conversion)",
+            "Production quality loss (2%)",
+            "Total saleable inventory",
+            "Sales",
+            "Remaining inventory [negative = stockout]",
+        ],
+    )
+
+    remaining_all = all_runs[:, :, 7]
+    sales_row = lifecycle_df.loc["Sales"].astype(float).values
+    s_idx = np.where(sales_row > 0)[0]
+    ay_idx = int(s_idx[-1]) if len(s_idx) else horizon_years - 1
+
+    thr = float(threshold)
+
+    def _row_stats(arr):
+        return {
+            "Mean remaining": float(arr.mean()),
+            "Median remaining": float(np.median(arr)),
+            "P90 remaining": float(np.percentile(arr, 90)),
+            "P(remaining > 0)": float((arr > 0).mean()),
+            f"P(remaining > {thr:.0f})": float((arr > thr).mean()),
+            "P(stockout)": float((arr < 0).mean()),
+        }
+
+    summary_df = pd.DataFrame.from_dict(
+        {
+            f"Last sales year (Year {ay_idx + 1})": _row_stats(remaining_all[:, ay_idx]),
+            f"End of horizon (Year {horizon_years})": _row_stats(remaining_all[:, -1]),
+        },
+        orient="index",
+    )
+    return lifecycle_df, summary_df, ay_idx, []
+
+
 # ── Streamlit Dashboard ──────────────────────────────────────────────────────
 
 def render_sidebar(data):
     """Render all sidebar controls and return their current values as a dict."""
+
+    st.sidebar.header("Simulation Mode")
+    mode_label = st.sidebar.radio(
+        "Mode",
+        options=["Single-start portfolio", "Multi-year launch cohorts"],
+        index=0,
+    )
+    mode = "single" if mode_label == "Single-start portfolio" else "multi"
 
     st.sidebar.header("Product Selection")
     selected_products = st.sidebar.multiselect(
@@ -667,10 +777,6 @@ def render_sidebar(data):
     )
 
     st.sidebar.header("Production Constraints")
-    carryover_k = st.sidebar.slider(
-        "Stop if carryover > k x next-yr sales (k)",
-        min_value=0.0, max_value=5.0, value=0.0, step=0.1,
-    )
     use_floor = st.sidebar.checkbox("Enable minimum production floor", value=False)
     min_floor = 0.0
     if use_floor:
@@ -678,8 +784,35 @@ def render_sidebar(data):
             "Min production floor",
             min_value=0.0, max_value=20000.0, value=0.0, step=500.0,
         )
+    use_max_carry = st.sidebar.checkbox("Enable maximum carryover cap", value=False)
+    max_carryover = 0.0
+    if use_max_carry:
+        max_carryover = st.sidebar.slider(
+            "Max carry-in inventory",
+            min_value=0.0, max_value=50000.0, value=10000.0, step=500.0,
+        )
+
+    launch_plan_df = None
+    if mode == "multi":
+        st.sidebar.header("Launch Cohorts (Y0-Y5)")
+        launch_rows = []
+        for a in sorted(data["median_sales_df"]["Archetype"].dropna().unique()):
+            for m in NEEDED_MATURITIES:
+                launch_rows.append({
+                    "Archetype": a,
+                    "Maturity": m,
+                    **{f"Y{y}": 0 for y in LAUNCH_YEARS},
+                })
+        launch_plan_df = st.sidebar.data_editor(
+            pd.DataFrame(launch_rows),
+            num_rows="fixed",
+            use_container_width=True,
+            key="launch_plan_editor",
+        )
 
     return {
+        "mode": mode,
+        "mode_label": mode_label,
         "products": selected_products,
         "strategy": strategy,
         "strategy_label": strategy_label,
@@ -690,9 +823,11 @@ def render_sidebar(data):
         "year_mode_label": year_mode_label,
         "custom_year_idx": custom_year_idx,
         "threshold": threshold,
-        "carryover_k": carryover_k,
         "use_floor": use_floor,
         "min_floor": min_floor,
+        "use_max_carry": use_max_carry,
+        "max_carryover": max_carryover,
+        "launch_plan_df": launch_plan_df,
     }
 
 
@@ -807,11 +942,13 @@ def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params):
         return
 
     # Config summary (always visible above tabs)
-    product_list_str = ", ".join([f"{a} | {m}" for a, m in parsed])
+    product_list_str = ", ".join([f"{a} | {m}" for a, m in parsed]) if parsed else "Launch cohort mix"
     st.markdown(f"""
 **Products:** {product_list_str}
 | Setting | Value |
 |---|---|
+| Mode | {params['mode_label']} |
+| Source model | {MODEL_NOTEBOOK} |
 | Strategy | {params['strategy_label']} |
 | Distribution | Lognormal (salesVariability.xlsx) &mdash; Yield & conversion: Normal |
 | Simulations | {params['iterations']:,} |
@@ -829,7 +966,7 @@ def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params):
     c3.metric("P(remaining > 0)", f"{sel_row['P(remaining > 0)']:.1%}")
     c4.metric("P(stockout)", f"{sel_row['P(stockout)']:.1%}")
 
-    year_order = [f"Year {i}" for i in range(1, 11)]
+    year_order = list(lifecycle_df.columns)
 
     if "view_mode" not in st.session_state:
         st.session_state["view_mode"] = "table"
@@ -891,26 +1028,43 @@ def main():
         st.markdown("<div style='height: 1.2rem'></div>", unsafe_allow_html=True)
         run_clicked = st.button("Run Simulation", type="primary", use_container_width=True)
 
-    if not params["products"]:
+    if params["mode"] == "single" and not params["products"]:
         st.info("Select one or more products from the sidebar, then click **Run Simulation**.")
         return
 
     if run_clicked:
         with st.spinner("Running Monte Carlo simulation..."):
-            lifecycle_df, summary_df, ay_idx, parsed, warnings = build_lifecycle_sim(
-                data,
-                params["products"],
-                params["iterations"],
-                params["seed"],
-                params["strategy"],
-                params["custom_sliders"],
-                params["carryover_k"],
-                params["use_floor"],
-                params["min_floor"],
-                params["year_mode"],
-                params["custom_year_idx"],
-                params["threshold"],
-            )
+            if params["mode"] == "single":
+                lifecycle_df, summary_df, ay_idx, parsed, warnings = build_lifecycle_sim(
+                    data,
+                    params["products"],
+                    params["iterations"],
+                    params["seed"],
+                    params["strategy"],
+                    params["custom_sliders"],
+                    params["use_floor"],
+                    params["min_floor"],
+                    params["use_max_carry"],
+                    params["max_carryover"],
+                    params["year_mode"],
+                    params["custom_year_idx"],
+                    params["threshold"],
+                )
+            else:
+                lifecycle_df, summary_df, ay_idx, warnings = run_multiyear_launch_sim(
+                    data,
+                    params["launch_plan_df"],
+                    params["iterations"],
+                    params["seed"],
+                    params["strategy"],
+                    params["custom_sliders"],
+                    params["use_floor"],
+                    params["min_floor"],
+                    params["use_max_carry"],
+                    params["max_carryover"],
+                    params["threshold"],
+                )
+                parsed = []
         st.session_state["results"] = {
             "lifecycle_df": lifecycle_df,
             "summary_df": summary_df,
