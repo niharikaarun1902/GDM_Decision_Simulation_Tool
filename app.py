@@ -19,7 +19,7 @@ import altair as alt
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FILE_PATH = os.path.join(BASE_DIR, "data.xlsx")
 SALES_VAR_PATH = os.path.join(BASE_DIR, "salesVariability.xlsx")
-MODEL_NOTEBOOK = "GDM_final.ipynb"
+MODEL_NOTEBOOK = "GDM_final (2).ipynb"
 
 NEEDED_MATURITIES = [85, 95, 105, 115]
 YEARS_NEEDED = list(range(2, 11))
