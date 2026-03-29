@@ -22,12 +22,18 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_NOTEBOOK = "GDM_final (2).ipynb"
 
 # Excel inputs — two modes:
-#   local    — data.xlsx and salesVariability.xlsx next to app.py (default when the two
-#              GDM_* secrets are not both set).
-#   secrets  — GDM_DATA_XLSX and GDM_SALES_VAR_XLSX only (env or st.secrets). Values:
-#              https URL, absolute path, or base64-encoded .xlsx. Mode is used when
-#              GDM_DATA_SOURCE=secrets, or when both GDM_* keys are set, or set GDM_DATA_SOURCE=local
-#              to force local files even if secrets exist.
+#   local    — data.xlsx and salesVariability.xlsx next to app.py (laptop dev only).
+#   secrets  — GDM_DATA_XLSX + GDM_SALES_VAR_XLSX (env or st.secrets). Streamlit Cloud
+#              uses secrets mode automatically so workbooks never need to be on GitHub.
+#   Override: GDM_DATA_SOURCE=local forces disk files; =secrets forces secret keys only.
+
+
+def _is_streamlit_cloud() -> bool:
+    """True on Streamlit Community Cloud (repo under /mount/src/); confidential Excel stays in Secrets."""
+    if os.environ.get("STREAMLIT_SHARING", "").lower() == "true":
+        return True
+    bd = os.path.abspath(BASE_DIR).replace("\\", "/")
+    return "/mount/src/" in bd
 
 
 def _resolve_secret_path(key: str):
@@ -56,6 +62,8 @@ def _config_mode() -> str:
     except Exception:
         pass
     if _resolve_secret_path("GDM_DATA_XLSX") and _resolve_secret_path("GDM_SALES_VAR_XLSX"):
+        return "secrets"
+    if _is_streamlit_cloud():
         return "secrets"
     return "local"
 
@@ -1100,7 +1108,17 @@ def main():
     data_src = _data_xlsx_source()
     sv_src = _sales_var_xlsx_source()
     if not _path_readable_for_excel(data_src) or not _path_readable_for_excel(sv_src):
-        st.error("Required Excel files were not found.")
+        if _config_mode() == "secrets":
+            st.error("Workbook secrets are missing, unreadable, or the URLs could not be loaded.")
+            st.markdown(
+                "On **Streamlit Cloud**, open your app → **⋮** → **Settings** → **Secrets** and "
+                "define **both** keys exactly (names are case-sensitive): **`GDM_DATA_XLSX`** and "
+                "**`GDM_SALES_VAR_XLSX`**. Paste a direct **`https://`** link to each file, or "
+                "paste **base64**-encoded `.xlsx` content. You do **not** need to commit Excel "
+                "files to GitHub. See `.streamlit/secrets.toml.example`."
+            )
+        else:
+            st.error("Required Excel files were not found.")
         if not _path_readable_for_excel(data_src):
             st.markdown(
                 f"- **Main workbook** (`data.xlsx` sheets): `{_describe_excel_source(data_src)}`"
@@ -1109,18 +1127,10 @@ def main():
             st.markdown(
                 f"- **Sales variability** (`salesVariability.xlsx`): `{_describe_excel_source(sv_src)}`"
             )
-        if _config_mode() == "secrets":
+        if _config_mode() != "secrets":
             st.markdown(
-                "In **secrets** mode, set **`GDM_DATA_XLSX`** and **`GDM_SALES_VAR_XLSX`** "
-                "(environment or Streamlit secrets) to a direct **`https://`** URL, a file path, "
-                "or **base64**-encoded `.xlsx` content. See `.streamlit/secrets.toml.example`."
-            )
-        else:
-            st.markdown(
-                "In **local** mode (default), place **`data.xlsx`** and **`salesVariability.xlsx`** "
-                "in the project folder next to `app.py`. For public deployment, set "
-                "**`GDM_DATA_SOURCE=secrets`** and the two `GDM_*` keys as in "
-                "`.streamlit/secrets.toml.example`."
+                "In **local** mode, place **`data.xlsx`** and **`salesVariability.xlsx`** next to "
+                "`app.py`. For Streamlit Cloud, the app uses **secrets** mode there automatically."
             )
         st.stop()
 
