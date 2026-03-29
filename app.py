@@ -8,6 +8,8 @@ uncertainty, and portfolio-level aggregation across multiple products.
 Run with:  streamlit run app.py
 """
 
+import base64
+import io
 import os
 import pandas as pd
 import numpy as np
@@ -17,9 +19,103 @@ import altair as alt
 # ── Configuration ────────────────────────────────────────────────────────────
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FILE_PATH = os.path.join(BASE_DIR, "data.xlsx")
-SALES_VAR_PATH = os.path.join(BASE_DIR, "salesVariability.xlsx")
 MODEL_NOTEBOOK = "GDM_final (2).ipynb"
+
+# Excel inputs — two modes:
+#   local    — data.xlsx and salesVariability.xlsx next to app.py (default when the two
+#              GDM_* secrets are not both set).
+#   secrets  — GDM_DATA_XLSX and GDM_SALES_VAR_XLSX only (env or st.secrets). Values:
+#              https URL, absolute path, or base64-encoded .xlsx. Mode is used when
+#              GDM_DATA_SOURCE=secrets, or when both GDM_* keys are set, or set GDM_DATA_SOURCE=local
+#              to force local files even if secrets exist.
+
+
+def _resolve_secret_path(key: str):
+    v = os.environ.get(key)
+    if v is not None and str(v).strip():
+        return str(v).strip()
+    try:
+        if key in st.secrets:
+            val = st.secrets[key]
+            if val is not None and str(val).strip():
+                return str(val).strip()
+    except Exception:
+        pass
+    return None
+
+
+def _config_mode() -> str:
+    v = os.environ.get("GDM_DATA_SOURCE", "").strip().lower()
+    if v in ("local", "secrets"):
+        return v
+    try:
+        if "GDM_DATA_SOURCE" in st.secrets:
+            s = str(st.secrets["GDM_DATA_SOURCE"]).strip().lower()
+            if s in ("local", "secrets"):
+                return s
+    except Exception:
+        pass
+    if _resolve_secret_path("GDM_DATA_XLSX") and _resolve_secret_path("GDM_SALES_VAR_XLSX"):
+        return "secrets"
+    return "local"
+
+
+def _normalize_excel_input(raw: str):
+    """Return a path/URL string, or BytesIO for base64-encoded .xlsx content."""
+    raw = raw.strip()
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw
+    if os.path.isfile(raw):
+        return raw
+    try:
+        cleaned = "".join(raw.split())
+        pad = (-len(cleaned)) % 4
+        if pad:
+            cleaned += "=" * pad
+        decoded = base64.b64decode(cleaned, validate=False)
+        if len(decoded) >= 4 and decoded[:2] == b"PK":
+            return io.BytesIO(decoded)
+    except Exception:
+        pass
+    return raw
+
+
+def _data_xlsx_source():
+    if _config_mode() == "local":
+        return os.path.join(BASE_DIR, "data.xlsx")
+    raw = _resolve_secret_path("GDM_DATA_XLSX")
+    if not raw:
+        return None
+    return _normalize_excel_input(raw)
+
+
+def _sales_var_xlsx_source():
+    if _config_mode() == "local":
+        return os.path.join(BASE_DIR, "salesVariability.xlsx")
+    raw = _resolve_secret_path("GDM_SALES_VAR_XLSX")
+    if not raw:
+        return None
+    return _normalize_excel_input(raw)
+
+
+def _describe_excel_source(src) -> str:
+    if src is None:
+        return "<not set>"
+    if isinstance(src, io.BytesIO):
+        return "<embedded workbook from secret>"
+    s = str(src)
+    return s if len(s) <= 200 else s[:197] + "..."
+
+
+def _path_readable_for_excel(source) -> bool:
+    if source is None:
+        return False
+    if isinstance(source, io.BytesIO):
+        return True
+    p = str(source)
+    if p.startswith("http://") or p.startswith("https://"):
+        return True
+    return os.path.isfile(p)
 
 NEEDED_MATURITIES = [85, 95, 105, 115]
 YEARS_NEEDED = list(range(2, 11))
@@ -161,11 +257,15 @@ def _parse_sv_long(sv_raw, header_row, arch_col, year_cols):
 def load_all_data():
     """Load and parse both Excel files. Returns a dict of all derived tables."""
 
-    # -- Load sheets from data.xlsx --
-    conv_tab = pd.read_excel(FILE_PATH, sheet_name="Conversion rates")
-    yield_tab = pd.read_excel(FILE_PATH, sheet_name="Production yields")
-    params_tab = pd.read_excel(FILE_PATH, sheet_name="Product parameters")
-    sales_raw = pd.read_excel(FILE_PATH, sheet_name="Sales volume parameters", header=None)
+    main_src = _data_xlsx_source()
+    sales_src = _sales_var_xlsx_source()
+
+    # -- Load sheets from data workbook (ExcelFile keeps one open file / buffer for all sheets) --
+    with pd.ExcelFile(main_src) as main_xls:
+        conv_tab = pd.read_excel(main_xls, sheet_name="Conversion rates")
+        yield_tab = pd.read_excel(main_xls, sheet_name="Production yields")
+        params_tab = pd.read_excel(main_xls, sheet_name="Product parameters")
+        sales_raw = pd.read_excel(main_xls, sheet_name="Sales volume parameters", header=None)
 
     for df_ in [conv_tab, yield_tab, params_tab]:
         df_.columns = df_.columns.astype(str).str.strip()
@@ -281,7 +381,7 @@ def load_all_data():
     # -- Sales Variability (lognormal params) --
     # TODO: Row/column indices here are hardcoded to the current salesVariability.xlsx layout.
     #       If that spreadsheet is restructured, these offsets will need updating.
-    sv_raw = pd.read_excel(SALES_VAR_PATH, sheet_name="Sales volume parameters", header=None)
+    sv_raw = pd.read_excel(sales_src, sheet_name="Sales volume parameters", header=None)
 
     fy_mat_cols = {85: 1, 95: 2, 105: 3, 115: 4}
     fy_mu_header = 4
@@ -996,6 +1096,33 @@ def main():
     with title_col:
         st.title("Monte Carlo Production & Inventory Planner")
         st.caption("10-year lifecycle simulation with lognormal sales variability, yield & conversion uncertainty")
+
+    data_src = _data_xlsx_source()
+    sv_src = _sales_var_xlsx_source()
+    if not _path_readable_for_excel(data_src) or not _path_readable_for_excel(sv_src):
+        st.error("Required Excel files were not found.")
+        if not _path_readable_for_excel(data_src):
+            st.markdown(
+                f"- **Main workbook** (`data.xlsx` sheets): `{_describe_excel_source(data_src)}`"
+            )
+        if not _path_readable_for_excel(sv_src):
+            st.markdown(
+                f"- **Sales variability** (`salesVariability.xlsx`): `{_describe_excel_source(sv_src)}`"
+            )
+        if _config_mode() == "secrets":
+            st.markdown(
+                "In **secrets** mode, set **`GDM_DATA_XLSX`** and **`GDM_SALES_VAR_XLSX`** "
+                "(environment or Streamlit secrets) to a direct **`https://`** URL, a file path, "
+                "or **base64**-encoded `.xlsx` content. See `.streamlit/secrets.toml.example`."
+            )
+        else:
+            st.markdown(
+                "In **local** mode (default), place **`data.xlsx`** and **`salesVariability.xlsx`** "
+                "in the project folder next to `app.py`. For public deployment, set "
+                "**`GDM_DATA_SOURCE=secrets`** and the two `GDM_*` keys as in "
+                "`.streamlit/secrets.toml.example`."
+            )
+        st.stop()
 
     data = load_all_data()
     params = render_sidebar(data)
