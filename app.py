@@ -23,8 +23,8 @@ MODEL_NOTEBOOK = "GDM_final (2).ipynb"
 
 # Excel inputs — two modes:
 #   local    — data.xlsx and salesVariability.xlsx next to app.py (laptop dev only).
-#   secrets  — GDM_DATA_XLSX + GDM_SALES_VAR_XLSX (env or st.secrets). Streamlit Cloud
-#              uses secrets mode automatically so workbooks never need to be on GitHub.
+#   secrets  — DATA_XLSX + SALES_VAR_XLSX (env or st.secrets); GDM_* names still work as aliases.
+#              On Streamlit Cloud, secrets mode is automatic so workbooks need not be on GitHub.
 #   Override: GDM_DATA_SOURCE=local forces disk files; =secrets forces secret keys only.
 
 
@@ -50,6 +50,16 @@ def _resolve_secret_path(key: str):
     return None
 
 
+def _resolve_data_xlsx_raw():
+    """Prefer DATA_XLSX; fall back to GDM_DATA_XLSX."""
+    return _resolve_secret_path("DATA_XLSX") or _resolve_secret_path("GDM_DATA_XLSX")
+
+
+def _resolve_sales_var_xlsx_raw():
+    """Prefer SALES_VAR_XLSX; fall back to GDM_SALES_VAR_XLSX."""
+    return _resolve_secret_path("SALES_VAR_XLSX") or _resolve_secret_path("GDM_SALES_VAR_XLSX")
+
+
 def _config_mode() -> str:
     v = os.environ.get("GDM_DATA_SOURCE", "").strip().lower()
     if v in ("local", "secrets"):
@@ -61,7 +71,7 @@ def _config_mode() -> str:
                 return s
     except Exception:
         pass
-    if _resolve_secret_path("GDM_DATA_XLSX") and _resolve_secret_path("GDM_SALES_VAR_XLSX"):
+    if _resolve_data_xlsx_raw() and _resolve_sales_var_xlsx_raw():
         return "secrets"
     if _is_streamlit_cloud():
         return "secrets"
@@ -91,7 +101,7 @@ def _normalize_excel_input(raw: str):
 def _data_xlsx_source():
     if _config_mode() == "local":
         return os.path.join(BASE_DIR, "data.xlsx")
-    raw = _resolve_secret_path("GDM_DATA_XLSX")
+    raw = _resolve_data_xlsx_raw()
     if not raw:
         return None
     return _normalize_excel_input(raw)
@@ -100,7 +110,7 @@ def _data_xlsx_source():
 def _sales_var_xlsx_source():
     if _config_mode() == "local":
         return os.path.join(BASE_DIR, "salesVariability.xlsx")
-    raw = _resolve_secret_path("GDM_SALES_VAR_XLSX")
+    raw = _resolve_sales_var_xlsx_raw()
     if not raw:
         return None
     return _normalize_excel_input(raw)
@@ -1112,8 +1122,9 @@ def main():
             st.error("Workbook secrets are missing, unreadable, or the URLs could not be loaded.")
             st.markdown(
                 "On **Streamlit Cloud**, open your app → **⋮** → **Settings** → **Secrets** and "
-                "define **both** keys exactly (names are case-sensitive): **`GDM_DATA_XLSX`** and "
-                "**`GDM_SALES_VAR_XLSX`**. Paste a direct **`https://`** link to each file, or "
+                "define **both** keys exactly (names are case-sensitive): **`DATA_XLSX`** and "
+                "**`SALES_VAR_XLSX`** (aliases **`GDM_DATA_XLSX`** / **`GDM_SALES_VAR_XLSX`** also work). "
+                "Paste a direct **`https://`** link to each file, or "
                 "paste **base64**-encoded `.xlsx` content. You do **not** need to commit Excel "
                 "files to GitHub. See `.streamlit/secrets.toml.example`."
             )
