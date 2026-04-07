@@ -58,7 +58,10 @@ def explain_table(df, context_text=""):
             "Monte Carlo simulation table.\n"
             f"Context: {context_text}\n"
             f"Table data: {df_json}\n"
-            "Focus on key takeaways and risks (e.g., stockouts)."
+            "IMPORTANT: All quantities are in bushels (units of seed), NOT dollars. "
+            "Do not use dollar signs ($) or currency symbols anywhere in your response. "
+            "Use 'units' or 'bushels' when referring to quantities. "
+            "Focus on key takeaways and risks (e.g., stockouts, excess inventory)."
         )
 
         payload = {
@@ -201,7 +204,7 @@ def _path_readable_for_excel(source) -> bool:
 
 NEEDED_MATURITIES = [85, 95, 105, 115]
 YEARS_NEEDED = list(range(2, 11))
-LAUNCH_YEARS = list(range(0, 6))
+# LAUNCH_YEARS is now dynamic — set from a sidebar slider in render_sidebar()
 
 STRATEGY_OPTIONS = {
     "Custom multiplier by year (Y1-Y10)": "custom",
@@ -292,11 +295,23 @@ def to_rate(x):
 # ── Data Loading (cached) ───────────────────────────────────────────────────
 
 @st.cache_data(show_spinner="Loading data from Excel files...")
-def load_all_data():
-    """Load and parse both Excel files. Returns a dict of all derived tables."""
+def load_all_data(main_src=None, sales_src=None):
+    """Load and parse both Excel files. Returns a dict of all derived tables.
 
-    main_src = _data_xlsx_source()
-    sales_src = _sales_var_xlsx_source()
+    main_src / sales_src can be:
+      - None          → resolved from secrets / local disk (default behaviour)
+      - bytes         → content of an uploaded .xlsx file
+      - str / path    → file path or URL (existing behaviour)
+    """
+    if main_src is None:
+        main_src = _data_xlsx_source()
+    if sales_src is None:
+        sales_src = _sales_var_xlsx_source()
+    # If bytes were passed (from st.file_uploader), wrap in BytesIO
+    if isinstance(main_src, bytes):
+        main_src = io.BytesIO(main_src)
+    if isinstance(sales_src, bytes):
+        sales_src = io.BytesIO(sales_src)
 
     # -- Load sheets from data workbook (ExcelFile keeps one open file / buffer for all sheets) --
     with pd.ExcelFile(main_src) as main_xls:
@@ -778,17 +793,26 @@ def build_lifecycle_sim(data, products, iterations, seed, strategy, custom_slide
 
 
 def build_launch_cohorts(launch_plan_df):
-    """From launch plan table, create (archetype, maturity, launch_year, n_products)."""
+    """From launch plan table, create (archetype, maturity, launch_year, n_products).
+    Columns are named Y1, Y2, ... and are read dynamically — no hardcoded LAUNCH_YEARS.
+    launch_year is 0-based (Y1->0, Y2->1) so results label Year 1 as the first year.
+    """
     cohorts = []
+    year_cols = sorted(
+        [c for c in launch_plan_df.columns
+         if isinstance(c, str) and c.startswith("Y") and c[1:].isdigit()],
+        key=lambda c: int(c[1:])
+    )
     for _, row in launch_plan_df.iterrows():
         arch = str(row.get("Archetype", "")).strip()
         if not arch or arch.lower() == "nan":
             continue
         maturity = int(row["Maturity"])
-        for y in LAUNCH_YEARS:
-            n = int(row.get(f"Y{y}", 0) or 0)
+        for col in year_cols:
+            launch_year = int(col[1:]) - 1   # Y1->0, Y2->1, ... (0-based)
+            n = int(row.get(col, 0) or 0)
             if n > 0:
-                cohorts.append((arch, maturity, y, n))
+                cohorts.append((arch, maturity, launch_year, n))
     return cohorts
 
 
@@ -900,41 +924,79 @@ def render_sidebar(data):
         "Mode",
         options=["Single-start portfolio", "Multi-year launch cohorts"],
         index=0,
+        help="Single-start: one or more products from Year 1. Multi-year: schedule launches across calendar years.",
     )
     mode = "single" if mode_label == "Single-start portfolio" else "multi"
 
-    # Show Product Selection in both modes (always rendered in "Inputs" section)
     st.sidebar.header("Product Selection")
     selected_products = st.sidebar.multiselect(
         "Products (Archetype | Maturity)",
         options=data["product_options"],
         default=[data["product_options"][0]] if data["product_options"] else [],
+        help="Archetype = seed treatment type. Maturity = crop days rating (85, 95, 105, 115).",
     )
+
+    # ── Multi-year launch year count (only shown in multi mode) ──────────────
+    n_launch_years = 6   # default
+    if mode == "multi":
+        st.sidebar.header("Launch Plan Settings")
+        n_launch_years = st.sidebar.slider(
+            "Number of launch years",
+            min_value=1, max_value=15, value=6, step=1,
+            help="Number of launch year columns in the grid. Y1 = first simulation year.",
+        )
 
     st.sidebar.header("Production Strategy")
     strategy_label = st.sidebar.selectbox(
         "Strategy",
         options=list(STRATEGY_OPTIONS.keys()),
         index=0,
+        help="How much to produce relative to next year's expected sales. Custom lets you set a multiplier for each year.",
     )
     strategy = STRATEGY_OPTIONS[strategy_label]
 
-    custom_sliders = [1.5] * 10
+    # ── Per-year multipliers: unbounded number inputs (no slider) ─────────────
+    custom_multipliers = [1.5] * 10
     if strategy == "custom":
-        st.sidebar.markdown("**Per-year production multipliers**")
+        st.sidebar.markdown(
+            "**Per-year production multipliers** "
+            "<small style='color:#888'>(any value ≥ 0, including 0 to stop production)</small>",
+            unsafe_allow_html=True,
+        )
         cols_left, cols_right = st.sidebar.columns(2)
         for i in range(10):
             target = cols_left if i < 5 else cols_right
-            custom_sliders[i] = target.slider(
-                f"Y{i + 1}", min_value=0.5, max_value=3.0, value=1.5, step=0.1,
+            custom_multipliers[i] = target.number_input(
+                f"Year {i + 1}",
+                min_value=0.0,
+                value=1.5,
+                step=0.1,
+                format="%.2f",
                 key=f"mult_y{i + 1}",
+                help=f"Multiplier for Year {i + 1}. 0 = no production. 1.5 = produce 1.5x next year's sales.",
             )
 
     st.sidebar.header("Simulation Settings")
-    iterations = st.sidebar.slider("Number of simulations", 100, 5000, 1000, step=100)
-    seed = st.sidebar.number_input("Random seed", value=42, step=1)
+    iterations = st.sidebar.slider(
+        "Number of simulations", 100, 5000, 1000, step=100,
+        help="Number of Monte Carlo runs. More = more stable results but slower. 1,000 recommended.",
+    )
+    seed = st.sidebar.number_input(
+        "Random seed", value=42, step=1,
+        help="Fixes the random generator for reproducible results.",
+    )
 
-    # Analysis Year selection only available for single-start mode
+    # ── View mode toggle (restored) ───────────────────────────────────────────
+    st.sidebar.header("Results View")
+    view_mode = st.sidebar.radio(
+        "View mode",
+        options=["Table", "Chart"],
+        index=0,
+        help="Table: lifecycle data and probability summaries. Chart: sales vs production, supply vs demand, waterfall.",
+    )
+    st.session_state["view_mode"] = view_mode.lower()
+
+    # Analysis Year — single mode only
     year_mode = "last_sales"
     year_mode_label = "Last Year of Sales"
     custom_year_idx = 4
@@ -943,6 +1005,7 @@ def render_sidebar(data):
         year_mode_label = st.sidebar.selectbox(
             "Year mode",
             options=["Last Year of Sales", "Choose specific year"],
+            help="Last Year of Sales: auto-detects lifecycle end. Choose specific year: manually pick the year.",
         )
         year_mode = "last_sales" if year_mode_label == "Last Year of Sales" else "custom"
         if year_mode == "custom":
@@ -955,23 +1018,33 @@ def render_sidebar(data):
 
     threshold = st.sidebar.slider(
         "Remaining inventory threshold",
-        min_value=-10000.0, max_value=50000.0, value=0.0, step=500.0,
+        min_value=0.0, max_value=50000.0, value=0.0, step=500.0,
+        help="Reports P(remaining inventory > this value) — the main obsolescence risk metric.",
     )
 
     st.sidebar.header("Production Constraints")
-    use_floor = st.sidebar.checkbox("Enable minimum production floor", value=False)
+    use_floor = st.sidebar.checkbox(
+        "Enable minimum production floor", value=False,
+        help="Ensures planned production never falls below a minimum batch size. Does not force production in zero-production years.",
+    )
     min_floor = 0.0
     if use_floor:
-        min_floor = st.sidebar.slider(
-            "Min production floor",
-            min_value=0.0, max_value=20000.0, value=0.0, step=500.0,
+        min_floor = st.sidebar.number_input(
+            "Min production floor (units)",
+            min_value=0.0, value=1000.0, step=100.0, format="%.0f",
+            help="Minimum number of units to produce in any year where production is planned.",
         )
-    use_max_carry = st.sidebar.checkbox("Enable maximum carryover cap", value=False)
+
+    use_max_carry = st.sidebar.checkbox(
+        "Enable maximum carryover cap", value=False,
+        help="If carry-in inventory meets or exceeds this cap, production is skipped that year.",
+    )
     max_carryover = 0.0
     if use_max_carry:
-        max_carryover = st.sidebar.slider(
-            "Max carry-in inventory",
-            min_value=0.0, max_value=50000.0, value=10000.0, step=500.0,
+        max_carryover = st.sidebar.number_input(
+            "Max carry-in inventory (units)",
+            min_value=0.0, value=10000.0, step=500.0, format="%.0f",
+            help="Skip production when carry-in inventory reaches this level.",
         )
 
     return {
@@ -980,7 +1053,7 @@ def render_sidebar(data):
         "products": selected_products,
         "strategy": strategy,
         "strategy_label": strategy_label,
-        "custom_sliders": custom_sliders,
+        "custom_sliders": custom_multipliers,
         "iterations": iterations,
         "seed": seed,
         "year_mode": year_mode,
@@ -991,6 +1064,7 @@ def render_sidebar(data):
         "min_floor": min_floor,
         "use_max_carry": use_max_carry,
         "max_carryover": max_carryover,
+        "n_launch_years": n_launch_years,
         "launch_plan_df": None,  # Populated in main area for multi-year mode
     }
 
@@ -1096,16 +1170,13 @@ def _render_chart_view(lifecycle_df, year_order):
 def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params, product_results=None):
     """Render simulation results in the main area."""
 
-    # Force table view while debugging
-    st.session_state["view_mode"] = "table"
-
     # Warnings
     for w in (warnings or []):
         st.warning(w)
 
     if lifecycle_df is None:
         if params["mode"] == "multi":
-            st.error("No valid launch cohorts. Please enter at least one launch (Y0-Y5) in the table.")
+            st.error("No valid launch cohorts. Please enter at least one launch count (Y1 or later) in the table.")
         else:
             st.error("No valid products selected. Please choose at least one product.")
         return
@@ -1127,10 +1198,16 @@ def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params, p
                     with st.expander(f"{arch} | Maturity {mat}"):
                         st.dataframe(df_prod.round(1), use_container_width=True)
                         st.dataframe(summary_prod.round(3), use_container_width=True)
+                        # AI interpretation for each individual product
+                        st.write("DEBUG: calling explain_table on individual product lifecycle")
+                        explain_table(df_prod, f"{arch} | Maturity {mat} lifecycle")
                 else:
                     st.subheader(f"{arch} | Maturity {mat}")
                     st.dataframe(df_prod.round(1), use_container_width=True)
                     st.dataframe(summary_prod.round(3), use_container_width=True)
+                    # AI interpretation for each individual product (single mode)
+                    st.write("DEBUG: calling explain_table on individual product lifecycle")
+                    explain_table(df_prod, f"{arch} | Maturity {mat} lifecycle")
 
             if len(product_results) > 1:
                 st.subheader("Portfolio Aggregate")
@@ -1168,9 +1245,9 @@ def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params, p
             )
             st.altair_chart(chart, use_container_width=True)
     else:
-        # Simple chart-only fallback
-        st.subheader("Lifecycle Charts")
-        st.line_chart(lifecycle_df.T)
+        # Chart view — use full _render_chart_view with year ordering
+        year_order_for_chart = list(lifecycle_df.columns)
+        _render_chart_view(lifecycle_df, year_order_for_chart)
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
@@ -1230,7 +1307,50 @@ def main():
             )
         st.stop()
 
-    data = load_all_data()
+    # ── Optional file uploads (override secrets / local defaults) ───────────
+    with st.sidebar.expander("📂 Upload data files (optional)", expanded=False):
+        st.markdown(
+            "Upload your own `.xlsx` files to override the default data. "
+            "Files must follow the same sheet and column structure as the originals. "
+            "Leave blank to use the default files loaded from secrets or local disk."
+        )
+        uploaded_main = st.file_uploader(
+            "data.xlsx  (conversion rates, yields, product parameters, median sales)",
+            type=["xlsx"],
+            key="upload_main",
+            help=(
+                "Must contain sheets: Conversion rates, Production yields, "
+                "Product parameters, Sales volume parameters."
+            ),
+        )
+        uploaded_sv = st.file_uploader(
+            "salesVariability.xlsx  (lognormal sales parameters)",
+            type=["xlsx"],
+            key="upload_sv",
+            help=(
+                "Must contain sheet: Sales volume parameters with lognormal mu "
+                "and sigma² parameters for first-year sales and growth rates."
+            ),
+        )
+
+    # Resolve sources — uploaded files take priority over defaults
+    main_src_arg  = uploaded_main.read() if uploaded_main is not None else None
+    sales_src_arg = uploaded_sv.read()   if uploaded_sv   is not None else None
+
+    # Show which files are active
+    if uploaded_main or uploaded_sv:
+        active_lines = []
+        if uploaded_main:
+            active_lines.append(f"- **data.xlsx**: uploaded file ({uploaded_main.name})")
+        if uploaded_sv:
+            active_lines.append(f"- **salesVariability.xlsx**: uploaded file ({uploaded_sv.name})")
+        if not uploaded_main:
+            active_lines.append("- **data.xlsx**: default (secrets / local disk)")
+        if not uploaded_sv:
+            active_lines.append("- **salesVariability.xlsx**: default (secrets / local disk)")
+        st.info("**Active data sources:**\n" + "\n".join(active_lines))
+
+    data = load_all_data(main_src=main_src_arg, sales_src=sales_src_arg)
     params = render_sidebar(data)
 
     # ── Main Area Configuration ──────────────────────────────────────────────
@@ -1242,22 +1362,41 @@ def main():
             st.info("Please select one or more products from the sidebar to configure launch cohorts.")
             return
             
-        st.markdown("Set the launch count per product per year (Y0-Y5):")
+        n_ly = params.get("n_launch_years", 6)
+        launch_year_cols = [f"Y{y}" for y in range(1, n_ly + 1)]
+        st.markdown(
+            f"Set the number of products to launch per archetype/maturity per year "
+            f"(**Y1 = first simulation year**, Y{n_ly} = last). "
+            f"Each product runs for a 10-year lifecycle from its launch year."
+        )
         launch_rows = []
         for p in params["products"]:
             a, m_str = p.split(" | ")
             launch_rows.append({
                 "Archetype": a.strip(),
                 "Maturity": int(m_str.strip()),
-                **{f"Y{y}": 0 for y in LAUNCH_YEARS},
+                **{col: 0 for col in launch_year_cols},
             })
-        
-        # Grid rendered in main content
+
         params["launch_plan_df"] = st.data_editor(
             pd.DataFrame(launch_rows),
             num_rows="fixed",
             use_container_width=True,
             key="launch_plan_editor",
+            column_config={
+                "Archetype": st.column_config.TextColumn("Archetype", disabled=True),
+                "Maturity":  st.column_config.NumberColumn("Maturity", disabled=True),
+                **{
+                    col: st.column_config.NumberColumn(
+                        col,
+                        min_value=0,
+                        max_value=99,
+                        step=1,
+                        help=f"Number of products to launch in {col} (Year {int(col[1:])}).",
+                    )
+                    for col in launch_year_cols
+                },
+            },
         )
         
         button_text = "Run Multi-year Simulation"
