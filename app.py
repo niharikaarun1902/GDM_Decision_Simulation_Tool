@@ -34,21 +34,25 @@ def call_llm_api(payload, attempts=3):
     }
 
     for attempt in range(attempts):
-        resp = requests.post(BASE_URL, headers=headers, json=payload, timeout=30)
-        if resp.status_code == 200:
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
-        if resp.status_code == 429 and attempt < attempts - 1:
-            time.sleep(2 ** attempt)
-            continue
-        raise RuntimeError(f"API call failed with status {resp.status_code}. {resp.text}")
+        try:
+            resp = requests.post(BASE_URL, headers=headers, json=payload, timeout=30)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data["choices"][0]["message"]["content"]
+            if resp.status_code == 429 and attempt < attempts - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise RuntimeError(f"API call failed with status {resp.status_code}. {resp.text}")
+        except requests.exceptions.ReadTimeout:
+            if attempt < attempts - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise RuntimeError(f"API call failed due to timeout after {attempts} attempts.")
 
 def explain_table(df, context_text=""):
     """Builds a JSON payload from a DataFrame and renders an LLM explanation."""
     if not ENABLE_LLM_EXPLAIN:
         return
-
-    st.write("DEBUG: explain_table called", {"enabled": ENABLE_LLM_EXPLAIN, "context": context_text})
 
     try:
         # Build compact payload representation of the dataframe
@@ -74,14 +78,13 @@ def explain_table(df, context_text=""):
             "temperature": 0.4,
         }
 
-        st.write("DEBUG: about to call LLM", {"model": MODEL, "base_url": BASE_URL})
         with st.spinner("Generating AI explanation..."):
             explanation = call_llm_api(payload, attempts=1)
 
         st.markdown(f"**AI interpretation:**\n{explanation}")
     except Exception as e:
-        st.error(f"LLM explanation error: {repr(e)}")
-        st.stop()
+        st.warning("AI explanation is temporarily unavailable (timeout or connection issue).")
+        return
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -933,7 +936,7 @@ def render_sidebar(data):
         "Products (Archetype | Maturity)",
         options=data["product_options"],
         default=[data["product_options"][0]] if data["product_options"] else [],
-        help="Archetype = seed treatment type. Maturity = crop days rating (85, 95, 105, 115).",
+        help="Archetype = seed trait type. Maturity = relative maturity rating (85, 95, 105, 115).",
     )
 
     # ── Multi-year launch year count (only shown in multi mode) ──────────────
@@ -1199,35 +1202,29 @@ def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params, p
                         st.dataframe(df_prod.round(1), use_container_width=True)
                         st.dataframe(summary_prod.round(3), use_container_width=True)
                         # AI interpretation for each individual product
-                        st.write("DEBUG: calling explain_table on individual product lifecycle")
                         explain_table(df_prod, f"{arch} | Maturity {mat} lifecycle")
                 else:
                     st.subheader(f"{arch} | Maturity {mat}")
                     st.dataframe(df_prod.round(1), use_container_width=True)
                     st.dataframe(summary_prod.round(3), use_container_width=True)
                     # AI interpretation for each individual product (single mode)
-                    st.write("DEBUG: calling explain_table on individual product lifecycle")
                     explain_table(df_prod, f"{arch} | Maturity {mat} lifecycle")
 
             if len(product_results) > 1:
                 st.subheader("Portfolio Aggregate")
                 st.dataframe(lifecycle_df.round(1), use_container_width=True)
-                st.write("DEBUG: calling explain_table on portfolio lifecycle")
                 explain_table(lifecycle_df, "Portfolio aggregate lifecycle")
 
                 st.subheader("Portfolio Inventory Probability Summary")
                 st.dataframe(summary_df.round(3), use_container_width=True)
-                st.write("DEBUG: calling explain_table on portfolio summary")
                 explain_table(summary_df, "Portfolio aggregate probability summary")
         else:
             st.subheader("Median Lifecycle Across All Simulations")
             st.dataframe(lifecycle_df.round(1), use_container_width=True)
-            st.write("DEBUG: calling explain_table on median lifecycle across all runs")
             explain_table(lifecycle_df, "Median lifecycle across all runs")
 
             st.subheader("Inventory Probability Summary")
             st.dataframe(summary_df.round(3), use_container_width=True)
-            st.write("DEBUG: calling explain_table on global probability summary")
             explain_table(summary_df, "Global probability summary")
 
         st.subheader("Median Remaining Inventory by Year (Aggregate)")
@@ -1260,22 +1257,7 @@ def main():
 
     st.title("Monte Carlo Production & Inventory Planner")
     st.caption("10-year lifecycle simulation with lognormal sales variability, yield & conversion uncertainty")
-    if st.button("Test Purdue LLM", key="test_purdue_llm"):
-        try:
-            payload = {
-                "model": MODEL,
-                "messages": [
-                    {"role": "system", "content": "You are a helpful data analyst."},
-                    {"role": "user", "content": "Say 'hello from Purdue'."},
-                ],
-                "max_tokens": 20,
-                "temperature": 0,
-            }
-            st.write("DEBUG: hitting Purdue endpoint", {"base_url": BASE_URL, "model": MODEL})
-            txt = call_llm_api(payload, attempts=1)
-            st.success(f"Purdue LLM response: {txt}")
-        except Exception as e:
-            st.error(f"Purdue test failed: {e}")
+
 
     data_src = _data_xlsx_source()
     sv_src = _sales_var_xlsx_source()
