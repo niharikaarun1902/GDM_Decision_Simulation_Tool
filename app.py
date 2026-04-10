@@ -18,6 +18,7 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import altair as alt
+import validation
 
 # ── LLM Helpers ──────────────────────────────────────────────────────────────
 
@@ -65,7 +66,9 @@ def explain_table(df, context_text=""):
             "IMPORTANT: All quantities are in bushels (units of seed), NOT dollars. "
             "Do not use dollar signs ($) or currency symbols anywhere in your response. "
             "Use 'units' or 'bushels' when referring to quantities. "
-            "Focus on key takeaways and risks (e.g., stockouts, excess inventory)."
+            "Focus on key takeaways and risks (e.g., stockouts, excess inventory). "
+            "Note: 'Planned Sales' drives deterministic production. 'Actual Sales' is "
+            "the stochastic realization used to deplete inventory."
         )
 
         payload = {
@@ -317,11 +320,25 @@ def load_all_data(main_src=None, sales_src=None):
         sales_src = io.BytesIO(sales_src)
 
     # -- Load sheets from data workbook (ExcelFile keeps one open file / buffer for all sheets) --
-    with pd.ExcelFile(main_src) as main_xls:
-        conv_tab = pd.read_excel(main_xls, sheet_name="Conversion rates")
-        yield_tab = pd.read_excel(main_xls, sheet_name="Production yields")
-        params_tab = pd.read_excel(main_xls, sheet_name="Product parameters")
-        sales_raw = pd.read_excel(main_xls, sheet_name="Sales volume parameters", header=None)
+    with pd.ExcelFile(main_src) as main_xls, pd.ExcelFile(sales_src) as sales_xls:
+        main_val = validation.validate_main_workbook_structure(main_xls)
+        sales_val = validation.validate_sales_variability_workbook_structure(sales_xls)
+        
+        if not main_val["ok"] or not sales_val["ok"]:
+            errs = validation.format_validation_errors(main_val, sales_val)
+            raise validation.WorkbookValidationError(errs)
+
+        conv_sheet = validation.resolve_sheet_name(main_xls, ["conversion"])
+        yield_sheet = validation.resolve_sheet_name(main_xls, ["yield"])
+        params_sheet = validation.resolve_sheet_name(main_xls, ["product param"])
+        sales_sheet = validation.resolve_sheet_name(main_xls, ["sales", "vol"])
+
+        conv_tab = pd.read_excel(main_xls, sheet_name=conv_sheet)
+        yield_tab = pd.read_excel(main_xls, sheet_name=yield_sheet)
+        params_tab = pd.read_excel(main_xls, sheet_name=params_sheet)
+        sales_raw = pd.read_excel(main_xls, sheet_name=sales_sheet, header=None)
+        
+        sv_fy_mu, sv_fy_sig2, sv_gr_mu, sv_gr_sig2 = validation.extract_sales_variability(sales_xls)
 
     for df_ in [conv_tab, yield_tab, params_tab]:
         df_.columns = df_.columns.astype(str).str.strip()
@@ -435,51 +452,9 @@ def load_all_data(main_src=None, sales_src=None):
         )
 
     # -- Sales Variability (lognormal params) --
-    # TODO: Row/column indices here are hardcoded to the current salesVariability.xlsx layout.
-    #       If that spreadsheet is restructured, these offsets will need updating.
-    sv_raw = pd.read_excel(sales_src, sheet_name="Sales volume parameters", header=None)
-
-    sv_fy_mu = {}
-    for r in range(5, 10):
-        if pd.isna(sv_raw.iat[r, 0]):
-            continue
-        arch = str(sv_raw.iat[r, 0]).strip()
-        for mat, col in {85: 1, 95: 2, 105: 3, 115: 4}.items():
-            if not pd.isna(sv_raw.iat[r, col]):
-                sv_fy_mu[(arch, mat)] = float(sv_raw.iat[r, col])
-
-    sv_fy_sig2 = {}
-    for r in range(15, 20):
-        if pd.isna(sv_raw.iat[r, 0]):
-            continue
-        arch = str(sv_raw.iat[r, 0]).strip()
-        for mat, col in {85: 1, 95: 2, 105: 3, 115: 4}.items():
-            if not pd.isna(sv_raw.iat[r, col]):
-                sv_fy_sig2[(arch, mat)] = float(sv_raw.iat[r, col])
-
-    sv_gr_mu = {}
-    for r in range(5, 25):
-        arch = sv_raw.iat[r, 7]
-        mat = sv_raw.iat[r, 8]
-        if pd.isna(arch) or pd.isna(mat):
-            continue
-        arch = str(arch).strip()
-        mat = int(float(mat))
-        for yr in range(2, 11):
-            if not pd.isna(sv_raw.iat[r, 9 + (yr - 2)]):
-                sv_gr_mu[(arch, mat, yr)] = float(sv_raw.iat[r, 9 + (yr - 2)])
-
-    sv_gr_sig2 = {}
-    for r in range(5, 25):
-        arch = sv_raw.iat[r, 24]
-        mat = sv_raw.iat[r, 25]
-        if pd.isna(arch) or pd.isna(mat):
-            continue
-        arch = str(arch).strip()
-        mat = int(float(mat))
-        for yr in range(2, 11):
-            if not pd.isna(sv_raw.iat[r, 26 + (yr - 2)]):
-                sv_gr_sig2[(arch, mat, yr)] = float(sv_raw.iat[r, 26 + (yr - 2)])
+    # Automatically extracted via anchor parsing in validation.py
+    # and securely assigned in the `with` block above properly.
+    sv_gr_sig2_dict = sv_gr_sig2
 
     # -- Build product options list --
     product_options = []
@@ -565,6 +540,46 @@ def build_sales_curve(data, archetype, maturity):
     return np.array(sales, dtype=float)
 
 
+def build_planned_sales_curve(data, archetype, maturity, method="expected_value"):
+    """
+    Deterministic expected sales sequence, used primarily for forward-looking 
+    production planning rather than historical realization.
+    
+    Planned Sales = expected simulated demand used for forward planning:
+    - Year 1 planned sales = expected value of the Year 1 sales distribution.
+    - Years 2-10 planned sales = previous year's planned sales multiplied by the expected value of each year's growth distribution.
+    
+    For Lognormal(mu, sigma^2), E[X] = exp(mu + sigma^2 / 2).
+    Falls back to legacy median-based logic if stochastic parameters are unavailable.
+    """
+    fy_mu = data["sv_fy_mu"].get((archetype, maturity))
+    fy_sig2 = data["sv_fy_sig2"].get((archetype, maturity))
+
+    if fy_mu is None or fy_sig2 is None:
+        return build_sales_curve(data, archetype, maturity)
+
+    ev_y1 = float(np.exp(fy_mu + fy_sig2 / 2.0))
+    sales = [ev_y1]
+
+    for yr in range(2, 11):
+        gr_mu = data["sv_gr_mu"].get((archetype, maturity, yr))
+        gr_sig2 = data["sv_gr_sig2"].get((archetype, maturity, yr))
+
+        if gr_mu is None or gr_sig2 is None:
+            yoy = get_yoy_rates(data, archetype, maturity)
+            if yoy is not None:
+                rate = yoy[yr - 2]
+                sales.append(max(0.0, sales[-1] * (1.0 + rate)))
+            else:
+                sales.append(0.0)
+            continue
+
+        ev_growth = float(np.exp(gr_mu + gr_sig2 / 2.0))
+        sales.append(max(0.0, sales[-1] * ev_growth))
+
+    return np.array(sales, dtype=float)
+
+
 def draw_sales_curve(data, archetype, maturity, rng):
     """
     Draw one complete 10-year sales trajectory from lognormal parameters.
@@ -624,16 +639,14 @@ def get_yearly_multipliers(strategy, custom_sliders):
     return [1.5] * 10
 
 
-def simulate_one_run(data, sales, archetype, rng, mults, use_floor, min_floor,
-                     use_max_carry, max_carryover):
+def simulate_one_run(data, planned_sales, actual_sales, archetype, rng, mults, use_floor, min_floor,
+                     use_max_carry, max_carryover, strategy="custom"):
     """
     One Monte Carlo lifecycle:
-      sales      -- length-10 array (Year 1..10)
-      mults      -- 10 production multipliers
-      use_floor  -- whether to enforce minimum production floor
-      min_floor  -- minimum production floor value
-      use_max_carry -- whether to enforce maximum carryover cap
-      max_carryover -- absolute carry-in inventory cap
+      planned_sales -- deterministic length-10 array used for production planning
+      actual_sales  -- stochastic length-10 array used for realized depletion
+      mults         -- 10 production multipliers
+...
     """
     y_draw, c_draw = sample_yield_conv_normal(data, archetype, rng)
 
@@ -642,9 +655,13 @@ def simulate_one_run(data, sales, archetype, rng, mults, use_floor, min_floor,
     missed_sales = []
 
     for yr in range(10):
-        expected_sales_next = sales[yr + 1] if yr < 9 else 0.0
+        # JIT produces for current-year planned demand
+        if strategy == "jit":
+            expected_sales_target = planned_sales[yr]
+        else:
+            expected_sales_target = planned_sales[yr + 1] if yr < 9 else 0.0
 
-        planned_prod = mults[yr] * expected_sales_next
+        planned_prod = mults[yr] * expected_sales_target
 
         if use_max_carry and max_carryover > 0.0 and carryover >= max_carryover:
             planned_prod = 0.0
@@ -658,7 +675,7 @@ def simulate_one_run(data, sales, archetype, rng, mults, use_floor, min_floor,
         carry_loss = carryover * 0.10
 
         total_saleable = (carryover - carry_loss) + (new_prod - prod_loss)
-        remaining = total_saleable - sales[yr]
+        remaining = total_saleable - actual_sales[yr]
 
         missed = max(0.0, -remaining)
         missed_sales.append(missed)
@@ -670,7 +687,8 @@ def simulate_one_run(data, sales, archetype, rng, mults, use_floor, min_floor,
             new_prod,
             -prod_loss,
             total_saleable,
-            sales[yr],
+            planned_sales[yr],
+            actual_sales[yr],
             remaining,
         ])
         carryover = remaining
@@ -680,7 +698,7 @@ def simulate_one_run(data, sales, archetype, rng, mults, use_floor, min_floor,
 
 def determine_analysis_year(lifecycle_df, year_mode, custom_year_idx):
     """Resolve year-mode selection to a 0-based year index."""
-    sales_row = lifecycle_df.loc["Sales"].astype(float).values
+    sales_row = lifecycle_df.loc["Actual Sales"].astype(float).values
     if year_mode == "last_sales":
         idx = np.where(sales_row > 0)[0]
         return int(idx[-1]) if len(idx) else 9
@@ -722,7 +740,8 @@ def build_lifecycle_sim(data, products, iterations, seed, strategy, custom_slide
         "Actual production (after yield & conversion)",
         "Production quality loss (2%)",
         "Total saleable inventory",
-        "Sales",
+        "Planned Sales",
+        "Actual Sales",
         "Remaining inventory [negative = stockout]",
     ]
 
@@ -739,22 +758,27 @@ def build_lifecycle_sim(data, products, iterations, seed, strategy, custom_slide
         }
 
     for arch, maturity in parsed:
+        # 1) Derive deterministic planned sales curve for generation runs
+        planned_sales = build_planned_sales_curve(data, arch, maturity)
+        if planned_sales is None:
+            planned_sales = np.zeros(10)
+            
         prod_rows = []
         for _ in range(int(iterations)):
-            sales = draw_sales_curve(data, arch, maturity, rng)
+            actual_sales = draw_sales_curve(data, arch, maturity, rng)
             rows, _ = simulate_one_run(
-                data, sales, arch, rng, mults,
-                use_floor, min_floor, use_max_carry, max_carryover
+                data, planned_sales, actual_sales, arch, rng, mults,
+                use_floor, min_floor, use_max_carry, max_carryover, strategy
             )
             prod_rows.append(rows)
         prod_rows = np.stack(prod_rows, axis=0)
         run_rows_all.append(prod_rows)
         
-        prod_median = np.median(prod_rows, axis=0)
+        prod_median = prod_rows[0]
         df_prod = pd.DataFrame(prod_median.T, columns=cols, index=idx_labels)
         
-        rem_prod = prod_rows[:, :, 7]
-        sales_prod = df_prod.loc["Sales"].astype(float).values
+        rem_prod = prod_rows[:, :, 8]
+        sales_prod = df_prod.loc["Actual Sales"].astype(float).values
         ay_prod = int(np.where(sales_prod > 0)[0][-1]) if len(np.where(sales_prod > 0)[0]) else 9
         if year_mode != "last_sales":
             ay_prod = custom_year_idx
@@ -767,7 +791,7 @@ def build_lifecycle_sim(data, products, iterations, seed, strategy, custom_slide
         product_results.append((arch, maturity, df_prod, prod_summary_df))
 
     run_rows = np.sum(run_rows_all, axis=0)
-    median_rows = np.median(run_rows, axis=0)
+    median_rows = run_rows[0]
 
     lifecycle_df = pd.DataFrame(
         median_rows.T,
@@ -775,7 +799,7 @@ def build_lifecycle_sim(data, products, iterations, seed, strategy, custom_slide
         index=idx_labels,
     )
 
-    remaining_all = run_rows[:, :, 7]
+    remaining_all = run_rows[:, :, 8]
     ay_idx = determine_analysis_year(lifecycle_df, year_mode, custom_year_idx)
 
     sel_rem = remaining_all[:, ay_idx]
@@ -843,7 +867,7 @@ def run_multiyear_launch_sim(data, launch_plan_df, iterations, seed, strategy, c
             "P(stockout)": float((arr < 0).mean()),
         }
 
-    all_runs = np.zeros((int(iterations), horizon_years, 8), dtype=float)
+    all_runs = np.zeros((int(iterations), horizon_years, 9), dtype=float)
     unique_products = sorted({(arch, mat) for (arch, mat, _, _) in cohorts})
     product_results = []
     
@@ -855,22 +879,28 @@ def run_multiyear_launch_sim(data, launch_plan_df, iterations, seed, strategy, c
         "Actual production (after yield & conversion)",
         "Production quality loss (2%)",
         "Total saleable inventory",
-        "Sales",
+        "Planned Sales",
+        "Actual Sales",
         "Remaining inventory [negative = stockout]",
     ]
 
     for arch, mat in unique_products:
         base_runs = []
+        # 1) Derive deterministic planned sales curve for generation runs
+        planned_sales = build_planned_sales_curve(data, arch, mat)
+        if planned_sales is None:
+            planned_sales = np.zeros(10)
+            
         for _ in range(int(iterations)):
-            sales = draw_sales_curve(data, arch, mat, rng)
+            actual_sales = draw_sales_curve(data, arch, mat, rng)
             rows, _ = simulate_one_run(
-                data, sales, arch, rng, mults,
-                use_floor, min_floor, use_max_carry, max_carryover
+                data, planned_sales, actual_sales, arch, rng, mults,
+                use_floor, min_floor, use_max_carry, max_carryover, strategy
             )
             base_runs.append(rows)
         base_runs = np.stack(base_runs, axis=0)
 
-        prod_all = np.zeros((int(iterations), horizon_years, 8), dtype=float)
+        prod_all = np.zeros((int(iterations), horizon_years, 9), dtype=float)
         for _, _, launch_year, n_products in [c for c in cohorts if c[0] == arch and c[1] == mat]:
             for _ in range(n_products):
                 for it in range(int(iterations)):
@@ -881,11 +911,11 @@ def run_multiyear_launch_sim(data, launch_plan_df, iterations, seed, strategy, c
                     prod_all[it, start:end, :] += rows[:span, :]
         all_runs += prod_all
         
-        prod_median = np.median(prod_all, axis=0)
+        prod_median = prod_all[0]
         df_prod = pd.DataFrame(prod_median.T, columns=year_cols, index=idx_labels)
         
-        rem_prod = prod_all[:, :, 7]
-        sales_prod = df_prod.loc["Sales"].astype(float).values
+        rem_prod = prod_all[:, :, 8]
+        sales_prod = df_prod.loc["Actual Sales"].astype(float).values
         ay_prod = int(np.where(sales_prod > 0)[0][-1]) if len(np.where(sales_prod > 0)[0]) else horizon_years - 1
         
         prod_summary_df = pd.DataFrame.from_dict({
@@ -895,15 +925,15 @@ def run_multiyear_launch_sim(data, launch_plan_df, iterations, seed, strategy, c
         
         product_results.append((arch, mat, df_prod, prod_summary_df))
 
-    median_rows = np.median(all_runs, axis=0)
+    median_rows = all_runs[0]
     lifecycle_df = pd.DataFrame(
         median_rows.T,
         columns=year_cols,
         index=idx_labels,
     )
 
-    remaining_all = all_runs[:, :, 7]
-    sales_row = lifecycle_df.loc["Sales"].astype(float).values
+    remaining_all = all_runs[:, :, 8]
+    sales_row = lifecycle_df.loc["Actual Sales"].astype(float).values
     s_idx = np.where(sales_row > 0)[0]
     ay_idx = int(s_idx[-1]) if len(s_idx) else horizon_years - 1
 
@@ -932,28 +962,35 @@ def render_sidebar(data):
     mode = "single" if mode_label == "Single-start portfolio" else "multi"
 
     st.sidebar.header("Product Selection")
+    
+    if "selected_products" in st.session_state:
+        st.session_state["selected_products"] = [
+            p for p in st.session_state["selected_products"] 
+            if p in data["product_options"]
+        ]
+
     selected_products = st.sidebar.multiselect(
         "Products (Archetype | Maturity)",
         options=data["product_options"],
         default=[data["product_options"][0]] if data["product_options"] else [],
+        key="selected_products",
         help="Archetype = seed trait type. Maturity = relative maturity rating (85, 95, 105, 115).",
     )
 
     # ── Multi-year launch year count (only shown in multi mode) ──────────────
     n_launch_years = 6   # default
     if mode == "multi":
-        st.sidebar.header("Launch Plan Settings")
-        n_launch_years = st.sidebar.slider(
+        n_launch_years = st.sidebar.number_input(
             "Number of launch years",
-            min_value=1, max_value=15, value=6, step=1,
-            help="Number of launch year columns in the grid. Y1 = first simulation year.",
+            min_value=1, value=6, step=1,
+            help="Type the number of calendar launch years to include in the launch plan. Y1 is the first simulation year.",
         )
 
     st.sidebar.header("Production Strategy")
     strategy_label = st.sidebar.selectbox(
         "Strategy",
         options=list(STRATEGY_OPTIONS.keys()),
-        index=0,
+        index=list(STRATEGY_OPTIONS.values()).index("jit"),
         help="How much to produce relative to next year's expected sales. Custom lets you set a multiplier for each year.",
     )
     strategy = STRATEGY_OPTIONS[strategy_label]
@@ -989,15 +1026,7 @@ def render_sidebar(data):
         help="Fixes the random generator for reproducible results.",
     )
 
-    # ── View mode toggle (restored) ───────────────────────────────────────────
-    st.sidebar.header("Results View")
-    view_mode = st.sidebar.radio(
-        "View mode",
-        options=["Table", "Chart"],
-        index=0,
-        help="Table: lifecycle data and probability summaries. Chart: sales vs production, supply vs demand, waterfall.",
-    )
-    st.session_state["view_mode"] = view_mode.lower()
+    # (View mode toggle was removed per Patrick's instructions to use Tabs)
 
     # Analysis Year — single mode only
     year_mode = "last_sales"
@@ -1080,7 +1109,8 @@ def _render_chart_view(lifecycle_df, year_order):
     metrics = {
         "Planned Production": lifecycle_df.loc["Planned production"].values,
         "Actual Production": lifecycle_df.loc["Actual production (after yield & conversion)"].values,
-        "Sales": lifecycle_df.loc["Sales"].values,
+        "Planned Sales": lifecycle_df.loc["Planned Sales"].values,
+        "Actual Sales": lifecycle_df.loc["Actual Sales"].values,
     }
     sp_df = pd.DataFrame([
         {"Year": yr, "Metric": metric, "Value": float(vals[i])}
@@ -1091,8 +1121,8 @@ def _render_chart_view(lifecycle_df, year_order):
         x=alt.X("Year:N", sort=year_order, title="Year"),
         y=alt.Y("Value:Q", title="Units"),
         color=alt.Color("Metric:N", scale=alt.Scale(
-            domain=["Planned Production", "Actual Production", "Sales"],
-            range=["#4c78a8", "#72b7b2", "#f58518"],
+            domain=["Planned Production", "Actual Production", "Planned Sales", "Actual Sales"],
+            range=["#4c78a8", "#72b7b2", "#ffb570", "#f58518"],
         )),
         xOffset="Metric:N",
     )
@@ -1102,7 +1132,8 @@ def _render_chart_view(lifecycle_df, year_order):
     st.subheader("Total Saleable Inventory vs Sales")
     line_metrics = {
         "Total Saleable Inventory": lifecycle_df.loc["Total saleable inventory"].values,
-        "Sales": lifecycle_df.loc["Sales"].values,
+        "Planned Sales": lifecycle_df.loc["Planned Sales"].values,
+        "Actual Sales": lifecycle_df.loc["Actual Sales"].values,
     }
     line_df = pd.DataFrame([
         {"Year": yr, "Metric": metric, "Value": float(vals[i])}
@@ -1113,8 +1144,8 @@ def _render_chart_view(lifecycle_df, year_order):
         x=alt.X("Year:N", sort=year_order, title="Year"),
         y=alt.Y("Value:Q", title="Units"),
         color=alt.Color("Metric:N", scale=alt.Scale(
-            domain=["Total Saleable Inventory", "Sales"],
-            range=["#4c78a8", "#f58518"],
+            domain=["Total Saleable Inventory", "Planned Sales", "Actual Sales"],
+            range=["#4c78a8", "#ffb570", "#f58518"],
         )),
     )
     st.altair_chart(line_chart, use_container_width=True)
@@ -1135,7 +1166,7 @@ def _render_chart_view(lifecycle_df, year_order):
         ("Actual Production", float(col_data.loc["Actual production (after yield & conversion)"])),
         ("Production Loss",   float(col_data.loc["Production quality loss (2%)"])),
         ("Total Saleable",    None),
-        ("Sales",             float(-col_data.loc["Sales"])),
+        ("Actual Sales",      float(-col_data.loc["Actual Sales"])),
         ("Remaining",         None),
     ]
 
@@ -1192,13 +1223,13 @@ def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params, p
     if not year_order and lifecycle_df is not None:
         year_order = [c for c in lifecycle_df.columns if isinstance(c, str) and c.startswith("Y")]
 
-    view_mode = st.session_state.get("view_mode", "table")
-
-    if view_mode == "table":
+    tab1, tab2 = st.tabs(["Table", "Chart"])
+    
+    with tab1:
         if product_results:
             for arch, mat, df_prod, summary_prod in product_results:
                 if params.get("mode") == "multi":
-                    with st.expander(f"{arch} | Maturity {mat}"):
+                    with st.expander(f"{arch} | Maturity {mat}", expanded=True):
                         st.dataframe(df_prod.round(1), use_container_width=True)
                         st.dataframe(summary_prod.round(3), use_container_width=True)
                         # AI interpretation for each individual product
@@ -1219,15 +1250,15 @@ def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params, p
                 st.dataframe(summary_df.round(3), use_container_width=True)
                 explain_table(summary_df, "Portfolio aggregate probability summary")
         else:
-            st.subheader("Median Lifecycle Across All Simulations")
+            st.subheader("Representative Lifecycle Track (1 Stochastic Run)")
             st.dataframe(lifecycle_df.round(1), use_container_width=True)
-            explain_table(lifecycle_df, "Median lifecycle across all runs")
+            explain_table(lifecycle_df, "Representative lifecycle stochastic run")
 
             st.subheader("Inventory Probability Summary")
             st.dataframe(summary_df.round(3), use_container_width=True)
             explain_table(summary_df, "Global probability summary")
 
-        st.subheader("Median Remaining Inventory by Year (Aggregate)")
+        st.subheader("Representative Remaining Inventory by Year (Aggregate)")
         if "Remaining inventory [negative = stockout]" in lifecycle_df.index:
             remaining_row = lifecycle_df.loc["Remaining inventory [negative = stockout]"]
             chart_df = pd.DataFrame(
@@ -1241,7 +1272,8 @@ def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params, p
                 y=alt.Y("Remaining Inventory:Q"),
             )
             st.altair_chart(chart, use_container_width=True)
-    else:
+            
+    with tab2:
         # Chart view — use full _render_chart_view with year ordering
         year_order_for_chart = list(lifecycle_df.columns)
         _render_chart_view(lifecycle_df, year_order_for_chart)
@@ -1332,7 +1364,18 @@ def main():
             active_lines.append("- **salesVariability.xlsx**: default (secrets / local disk)")
         st.info("**Active data sources:**\n" + "\n".join(active_lines))
 
-    data = load_all_data(main_src=main_src_arg, sales_src=sales_src_arg)
+    try:
+        data = load_all_data(main_src=main_src_arg, sales_src=sales_src_arg)
+        st.success("Validation Summary: Workbooks loaded successfully.")
+    except validation.WorkbookValidationError as e:
+        st.error("We couldn't use the uploaded workbooks because they do not match the expected GDM format.")
+        for err_msg in e.validation_results:
+            st.warning(err_msg)
+        st.info("Please upload workbooks that match the GDM template.")
+        st.stop()
+    except Exception as e:
+        st.error(f"An unexpected error occurred while parsing the workbooks: {str(e)}")
+        st.stop()
     params = render_sidebar(data)
 
     # ── Main Area Configuration ──────────────────────────────────────────────
@@ -1360,26 +1403,27 @@ def main():
                 **{col: 0 for col in launch_year_cols},
             })
 
-        params["launch_plan_df"] = st.data_editor(
-            pd.DataFrame(launch_rows),
-            num_rows="fixed",
-            use_container_width=True,
-            key="launch_plan_editor",
-            column_config={
-                "Archetype": st.column_config.TextColumn("Archetype", disabled=True),
-                "Maturity":  st.column_config.NumberColumn("Maturity", disabled=True),
-                **{
-                    col: st.column_config.NumberColumn(
-                        col,
-                        min_value=0,
-                        max_value=99,
-                        step=1,
-                        help=f"Number of products to launch in {col} (Year {int(col[1:])}).",
-                    )
-                    for col in launch_year_cols
+        with st.expander("Configure multi-year launch plan", expanded=True):
+            params["launch_plan_df"] = st.data_editor(
+                pd.DataFrame(launch_rows),
+                num_rows="fixed",
+                use_container_width=True,
+                key="launch_plan_editor",
+                column_config={
+                    "Archetype": st.column_config.TextColumn("Archetype", disabled=True),
+                    "Maturity":  st.column_config.NumberColumn("Maturity", disabled=True),
+                    **{
+                        col: st.column_config.NumberColumn(
+                            col,
+                            min_value=0,
+                            max_value=99,
+                            step=1,
+                            help=f"Number of products to launch in {col} (Year {int(col[1:])}).",
+                        )
+                        for col in launch_year_cols
+                    },
                 },
-            },
-        )
+            )
         
         button_text = "Run Multi-year Simulation"
         run_clicked = st.button(button_text, type="primary")
