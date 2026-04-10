@@ -655,11 +655,8 @@ def simulate_one_run(data, planned_sales, actual_sales, archetype, rng, mults, u
     missed_sales = []
 
     for yr in range(10):
-        # JIT produces for current-year planned demand
-        if strategy == "jit":
-            expected_sales_target = planned_sales[yr]
-        else:
-            expected_sales_target = planned_sales[yr + 1] if yr < 9 else 0.0
+        # All strategies produce off current-year planned demand
+        expected_sales_target = planned_sales[yr]
 
         planned_prod = mults[yr] * expected_sales_target
 
