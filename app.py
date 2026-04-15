@@ -22,72 +22,270 @@ import validation
 
 # ── LLM Helpers ──────────────────────────────────────────────────────────────
 
-ENABLE_LLM_EXPLAIN = True
+def resolve_llm_setting(key, default=None):
+    v = os.environ.get(key)
+    if v is not None and str(v).strip():
+        return str(v).strip()
+    try:
+        if key in st.secrets:
+            val = st.secrets[key]
+            if val is not None and str(val).strip():
+                return str(val).strip()
+    except Exception:
+        pass
+    return default
 
-BASE_URL = "https://genai.rcac.purdue.edu/api/chat/completions"
-MODEL = "llama3.1:latest"  # or the exact Purdue model id
-API_KEY = "sk-54fe85005f2f41a69bb5b9d56c46c1d3"  # your Purdue key
+def get_llm_config():
+    enable_str = resolve_llm_setting("ENABLE_LLM_EXPLAIN", "true")
+    debug_str = resolve_llm_setting("LLM_DEBUG", "false")
+    return {
+        "enable": enable_str.lower() in ("true", "1", "yes"),
+        "debug": debug_str.lower() in ("true", "1", "yes"),
+        "base_url": resolve_llm_setting("LLM_BASE_URL", "https://genai.rcac.purdue.edu/api/chat/completions"),
+        "model": resolve_llm_setting("LLM_MODEL", "llama3.1:latest"),
+        "api_key": resolve_llm_setting("LLM_API_KEY", None),
+        "timeout": int(resolve_llm_setting("LLM_TIMEOUT", "45")),
+    }
 
-def call_llm_api(payload, attempts=3):
+def extract_llm_text(data):
+    if not isinstance(data, dict):
+        raise ValueError("Invalid JSON response schema")
+    
+    choices = data.get("choices")
+    if not choices or not isinstance(choices, list):
+        raise ValueError("Response missing 'choices' array")
+        
+    choice = choices[0]
+    
+    if "message" in choice and isinstance(choice["message"], dict):
+        msg = choice["message"]
+        if "content" in msg:
+            return msg["content"]
+            
+    if "text" in choice:
+        return choice["text"]
+        
+    raise ValueError("Could not extract text or message content from response")
+
+def call_llm_api(payload, config, attempts=3):
+    if not config["api_key"]:
+        raise ValueError("missing API key")
+        
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
+        "Authorization": f"Bearer {config['api_key']}",
         "Content-Type": "application/json",
     }
 
     for attempt in range(attempts):
         try:
-            resp = requests.post(BASE_URL, headers=headers, json=payload, timeout=30)
+            resp = requests.post(config["base_url"], headers=headers, json=payload, timeout=config["timeout"])
             if resp.status_code == 200:
                 data = resp.json()
-                return data["choices"][0]["message"]["content"]
+                return extract_llm_text(data)
+            
             if resp.status_code == 429 and attempt < attempts - 1:
                 time.sleep(2 ** attempt)
                 continue
-            raise RuntimeError(f"API call failed with status {resp.status_code}. {resp.text}")
-        except requests.exceptions.ReadTimeout:
+                
+            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
+            
+        except (requests.exceptions.ReadTimeout, requests.exceptions.Timeout):
             if attempt < attempts - 1:
                 time.sleep(2 ** attempt)
                 continue
-            raise RuntimeError(f"API call failed due to timeout after {attempts} attempts.")
+            raise RuntimeError(f"request timeout")
+        except requests.exceptions.ConnectionError:
+            if attempt < attempts - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise RuntimeError(f"connection error")
+        except ValueError as e:
+            raise RuntimeError(str(e)) # parsing issues shouldn't retry
+            
+    raise RuntimeError(f"API call failed after {attempts} attempts")
+
+def build_fallback_explanation(df, context_text=""):
+    """Local rule-based fallback interpretation when external API fails."""
+    lines = []
+    
+    if "P(depleted)" in df.columns or "Mean remaining" in df.columns:
+        # It's a summary table
+        # 1. Production/General 
+        lines.append(f"Aggregate probabilistic models for {context_text} demonstrate varying degrees of supply constraint and operational buffering across the simulated periods.")
+        
+        # 2. Sales fulfillment vs Depletion (Inventory)
+        max_deplete = 0
+        if "P(depleted)" in df.columns:
+            max_deplete = df["P(depleted)"].max()
+            
+        if max_deplete > 0.5:
+            lines.append(f"There is a high risk of inventory depletion (peaking at {max_deplete*100:.1f}%), suggesting planned buffers are frequently insufficient against demand volatility.")
+        elif max_deplete > 0.1:
+            lines.append("A moderate risk of inventory depletion is present, indicating that stochastic demand spikes or yield losses occasionally consume the entire safety stock.")
+        else:
+            lines.append("Inventory buffers remain highly robust across the entire horizon, effectively minimizing the risk of total depletion.")
+            
+        # 3. Unmet Demand
+        max_unmet = 0
+        if "P(unmet demand > 0)" in df.columns:
+            max_unmet = df["P(unmet demand > 0)"].max()
+            
+        if max_unmet > 0.1:
+            lines.append(f"Frequent depletion with unmet demand indicates the strategy may be under-producing relative to realized demand, leading to lost sales opportunities (probability up to {max_unmet*100:.1f}%).")
+        else:
+            lines.append("Sales are fulfilled in most simulated scenarios, suggesting the strategy is generally meeting demand.")
+            
+        # 4. Lifecycle Risk / Horizon (Mean Remaining)
+        if "Mean remaining" in df.columns:
+            end_mean = df["Mean remaining"].iloc[-1]
+            if end_mean > 0:
+                lines.append(f"Positive ending inventory (averaging {end_mean:,.0f} units) suggests some residual overbuild or obsolescence risk that should be monitored.")
+            else:
+                lines.append("End-of-horizon inventory approaches zero, limiting end-of-lifecycle carryover.")
+                
+    else:
+        # It's a lifecycle table
+        # 1. Production execution
+        planned_prod = 0
+        actual_prod = 0
+        if "Planned production" in df.index and "Actual production (after yield & conversion)" in df.index:
+            planned_prod = df.loc["Planned production"].astype(float).sum()
+            actual_prod = df.loc["Actual production (after yield & conversion)"].astype(float).sum()
+            
+        if actual_prod < planned_prod * 0.98:
+            lines.append("Actual production trails planned production, suggesting yield or conversion losses reduce available supply.")
+        elif actual_prod > 0:
+            lines.append("Actual production tracks planned production closely, indicating operations are broadly meeting targets.")
+        else:
+            lines.append("Production metrics remain strictly negligible across this specific trajectory.")
+
+        # 2. Sales fulfillment
+        planned_sales = 0
+        actual_sales = 0
+        if "Planned Sales" in df.index and "Actual Sales" in df.index:
+            planned_sales = df.loc["Planned Sales"].astype(float).sum()
+            actual_sales = df.loc["Actual Sales"].astype(float).sum()
+            
+        missed = 0
+        if "Unmet demand (lost sales)" in df.index:
+            missed = df.loc["Unmet demand (lost sales)"].astype(float).sum()
+            
+        if missed > 0:
+            lines.append("Sales appear fully absorbed by available inventory, which may indicate a lean plan with little excess buffer.")
+        elif actual_sales >= planned_sales * 0.95:
+            lines.append("Actual sales track planned sales closely, indicating demand is broadly being met under the current strategy.")
+        else:
+            lines.append("Actual sales fall below planned sales, indicating softer demand relative to the forecast.")
+
+        # 3. Inventory / Depletion
+        rem_sum = 0
+        if "Remaining inventory [0 = depleted]" in df.index:
+            rem_arr = df.loc["Remaining inventory [0 = depleted]"].astype(float).values
+            rem_sum = sum(rem_arr)
+            depleted_years = sum(1 for x in rem_arr if x <= 0.01)
+            
+            if depleted_years > 2:
+                lines.append("Repeated depletion suggests the plan appears to run with limited inventory buffer, increasing exposure to volatility.")
+            elif depleted_years > 0:
+                lines.append("Periodic inventory depletion occurs, signaling moments where the entire supply buffer was fully drawn down.")
+            else:
+                lines.append("Remaining inventory tends to carry over across the horizon without sustained full depletion.")
+
+        # 4. End-of-horizon implication
+        rem_end = 0
+        if "Remaining inventory [0 = depleted]" in df.index:
+            rem_end = df.loc["Remaining inventory [0 = depleted]"].astype(float).values[-1]
+            if rem_end > (planned_sales * 0.1 if planned_sales else 1000):
+                lines.append("Positive ending inventory suggests some residual overbuild or obsolescence risk that should be monitored.")
+            elif rem_end <= 0.01:
+                lines.append("The product concludes its lifecycle with depletion, limiting end-of-lifecycle carryover.")
+            else:
+                lines.append("A minor terminal inventory balance securely remains, reflecting a generally well-timed production ramp-down.")
+                
+    clean_lines = [x.strip() for x in lines if x and str(x).strip()]
+    return "\n".join(f"- {x}" for x in clean_lines)
 
 def explain_table(df, context_text=""):
-    """Builds a JSON payload from a DataFrame and renders an LLM explanation."""
-    if not ENABLE_LLM_EXPLAIN:
-        return
+    """Builds a JSON payload from a DataFrame and returns a dictionary with text and debug strings."""
+    config = get_llm_config()
+    
+    if not config["enable"]:
+        return {"text": None, "_debug_reason": None}
 
     try:
         # Build compact payload representation of the dataframe
         df_json = df.to_json(orient="split")
-        prompt = (
-            "Please provide a very concise, professional interpretation of this "
-            "Monte Carlo simulation table.\n"
-            f"Context: {context_text}\n"
-            f"Table data: {df_json}\n"
-            "IMPORTANT: All quantities are in bushels (units of seed), NOT dollars. "
-            "Do not use dollar signs ($) or currency symbols anywhere in your response. "
-            "Use 'units' or 'bushels' when referring to quantities. "
-            "Focus on key takeaways and risks (e.g., stockouts, excess inventory). "
-            "Note: 'Planned Sales' drives deterministic production. 'Actual Sales' is "
-            "the stochastic realization used to deplete inventory."
-        )
+        prompt = f"""
+Provide exactly 4 markdown bullet points interpreting this Monte Carlo simulation table for a business audience.
+
+Context: {context_text}
+Table data: {df_json}
+
+IMPORTANT:
+- All quantities are in bushels/units of seed, not dollars.
+- Do not use dollar signs or currency symbols.
+- Each bullet should be 1 to 2 full sentences.
+- Output bullet points only, with each bullet on its own line.
+- Do not write a paragraph, title, intro, or conclusion.
+- Planned Sales drives deterministic production.
+- Actual Sales equals realized demand capped at available inventory.
+
+When supported by the data, cover:
+1. planned vs actual production,
+2. sales fulfillment vs unmet demand,
+3. remaining inventory and depletion risk,
+4. the overall lifecycle or end-of-horizon implication.
+"""
 
         payload = {
-            "model": MODEL,
+            "model": config["model"],
             "messages": [
                 {"role": "system", "content": "You are a helpful data analyst."},
                 {"role": "user", "content": prompt},
             ],
-            "max_tokens": 200,
+            "max_tokens": 350,
             "temperature": 0.4,
         }
-
-        with st.spinner("Generating AI explanation..."):
-            explanation = call_llm_api(payload, attempts=1)
-
-        st.markdown(f"**AI interpretation:**\n{explanation}")
+        
     except Exception as e:
-        st.warning("AI explanation is temporarily unavailable (timeout or connection issue).")
-        return
+        return {
+            "text": build_fallback_explanation(df, context_text),
+            "_debug_reason": f"payload generation error: {str(e)}"
+        }
+
+    try:
+        explanation = call_llm_api(payload, config, attempts=3)
+        return {"text": explanation, "_debug_reason": None}
+    except Exception as e:
+        reason = str(e)
+        return {
+            "text": build_fallback_explanation(df, context_text),
+            "_debug_reason": reason
+        }
+
+def generate_all_explanations(lifecycle_df, summary_df, product_results):
+    """Generates all AI explanations after a successful simulation run."""
+    explanations = {}
+    config = get_llm_config()
+    
+    if not config["enable"]:
+        return explanations
+    
+    with st.spinner("Generating AI explanations..."):
+        if product_results:
+            explanations["product_results"] = {}
+            for arch, mat, df_prod, summary_prod in product_results:
+                key = f"{arch} | Maturity {mat}"
+                explanations["product_results"][key] = explain_table(df_prod, f"{key} lifecycle")
+            
+            if len(product_results) > 1:
+                explanations["lifecycle"] = explain_table(lifecycle_df, "Portfolio aggregate lifecycle")
+                explanations["summary"] = explain_table(summary_df, "Portfolio remaining inventory summary")
+        else:
+            explanations["lifecycle"] = explain_table(lifecycle_df, "Sample lifecycle track")
+            explanations["summary"] = explain_table(summary_df, "Global remaining inventory summary")
+            
+    return explanations
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -540,88 +738,7 @@ def build_sales_curve(data, archetype, maturity):
     return np.array(sales, dtype=float)
 
 
-def build_planned_sales_curve(data, archetype, maturity, method="expected_value"):
-    """
-    Deterministic expected sales sequence, used primarily for forward-looking 
-    production planning rather than historical realization.
-    
-    Planned Sales = expected simulated demand used for forward planning:
-    - Year 1 planned sales = expected value of the Year 1 sales distribution.
-    - Years 2-10 planned sales = previous year's planned sales multiplied by the expected value of each year's growth distribution.
-    
-    For Lognormal(mu, sigma^2), E[X] = exp(mu + sigma^2 / 2).
-    Falls back to legacy median-based logic if stochastic parameters are unavailable.
-    """
-    fy_mu = data["sv_fy_mu"].get((archetype, maturity))
-    fy_sig2 = data["sv_fy_sig2"].get((archetype, maturity))
 
-    if fy_mu is None or fy_sig2 is None:
-        return build_sales_curve(data, archetype, maturity)
-
-    ev_y1 = float(np.exp(fy_mu + fy_sig2 / 2.0))
-    sales = [ev_y1]
-
-    for yr in range(2, 11):
-        gr_mu = data["sv_gr_mu"].get((archetype, maturity, yr))
-        gr_sig2 = data["sv_gr_sig2"].get((archetype, maturity, yr))
-
-        if gr_mu is None or gr_sig2 is None:
-            yoy = get_yoy_rates(data, archetype, maturity)
-            if yoy is not None:
-                rate = yoy[yr - 2]
-                sales.append(max(0.0, sales[-1] * (1.0 + rate)))
-            else:
-                sales.append(0.0)
-            continue
-
-        ev_growth = float(np.exp(gr_mu + gr_sig2 / 2.0))
-        sales.append(max(0.0, sales[-1] * ev_growth))
-
-    return np.array(sales, dtype=float)
-
-
-def draw_sales_curve(data, archetype, maturity, rng):
-    """
-    Draw one complete 10-year sales trajectory from lognormal parameters.
-
-    Year 1 is sampled from Lognormal(mu, sigma). Each subsequent year's value
-    is computed by multiplying the prior year by a growth multiplier drawn from
-    Lognormal(mu, sigma) for that year.
-
-    Growth rate parameters near -9.21 (= log(~0)) signal end-of-lifecycle;
-    the drawn multiplier will be near zero, naturally collapsing sales.
-
-    Falls back to build_sales_curve() if any parameter is missing.
-    """
-    fy_mu = data["sv_fy_mu"].get((archetype, maturity))
-    fy_sig2 = data["sv_fy_sig2"].get((archetype, maturity))
-
-    if fy_mu is None or fy_sig2 is None:
-        return build_sales_curve(data, archetype, maturity)
-
-    fy_sigma = float(np.sqrt(max(fy_sig2, 1e-10)))
-    y1 = float(rng.lognormal(fy_mu, fy_sigma))
-
-    sales = [y1]
-    for yr in range(2, 11):
-        gr_mu = data["sv_gr_mu"].get((archetype, maturity, yr))
-        gr_sig2 = data["sv_gr_sig2"].get((archetype, maturity, yr))
-
-        if gr_mu is None or gr_sig2 is None:
-            yoy = get_yoy_rates(data, archetype, maturity)
-            if yoy is not None:
-                rate = yoy[yr - 2]
-                sales.append(max(0.0, sales[-1] * (1.0 + rate)))
-            else:
-                sales.append(0.0)
-            continue
-
-        gr_sigma = float(np.sqrt(max(gr_sig2, 1e-10)))
-        growth_draw = float(rng.lognormal(gr_mu, gr_sigma))
-        next_sales = sales[-1] * growth_draw
-        sales.append(max(0.0, next_sales))
-
-    return np.array(sales, dtype=float)
 
 
 # ── Simulation Engine ────────────────────────────────────────────────────────
@@ -639,12 +756,14 @@ def get_yearly_multipliers(strategy, custom_sliders):
     return [1.5] * 10
 
 
-def simulate_one_run(data, planned_sales, actual_sales, archetype, rng, mults, use_floor, min_floor,
+def simulate_one_run(data, archetype, maturity, rng, mults, use_floor, min_floor,
                      use_max_carry, max_carryover, strategy="custom"):
     """
     One Monte Carlo lifecycle:
-      planned_sales -- deterministic length-10 array used for production planning
-      actual_sales  -- stochastic length-10 array used for realized depletion
+      data          -- parsed from excel
+      archetype     -- product archetype
+      maturity      -- product maturity
+      rng           -- numpy random generator
       mults         -- 10 production multipliers
 ...
     """
@@ -653,11 +772,48 @@ def simulate_one_run(data, planned_sales, actual_sales, archetype, rng, mults, u
     carryover = 0.0
     rows = []
     missed_sales = []
+    
+    actual_sales_list = []
+    planned_sales_list = []
 
     for yr in range(10):
-        # All strategies produce off current-year planned demand
-        expected_sales_target = planned_sales[yr]
+        # 1) Determine planned sales and realized demand
+        if yr == 0:
+            fy_mu = data["sv_fy_mu"].get((archetype, maturity))
+            fy_sig2 = data["sv_fy_sig2"].get((archetype, maturity))
+            if fy_mu is not None and fy_sig2 is not None:
+                ev_y1 = float(np.exp(fy_mu + fy_sig2 / 2.0))
+                fy_sigma = float(np.sqrt(max(fy_sig2, 1e-10)))
+                y1_demand = float(rng.lognormal(fy_mu, fy_sigma))
+                expected_sales_target = ev_y1
+                realized_demand = y1_demand
+            else:
+                val = get_median_sales(data, archetype, maturity) or 0.0
+                expected_sales_target = val
+                realized_demand = val
+        else:
+            prior_actual_sales = actual_sales_list[-1]
+            gr_mu = data["sv_gr_mu"].get((archetype, maturity, yr + 1))
+            gr_sig2 = data["sv_gr_sig2"].get((archetype, maturity, yr + 1))
+            if gr_mu is not None and gr_sig2 is not None:
+                ev_growth = float(np.exp(gr_mu + gr_sig2 / 2.0))
+                gr_sigma = float(np.sqrt(max(gr_sig2, 1e-10)))
+                growth_draw = float(rng.lognormal(gr_mu, gr_sigma))
+            else:
+                yoy = get_yoy_rates(data, archetype, maturity)
+                if yoy is not None:
+                    ev_growth = 1.0 + yoy[yr - 1]
+                    growth_draw = ev_growth
+                else:
+                    ev_growth = 0.0
+                    growth_draw = 0.0
+            
+            expected_sales_target = prior_actual_sales * ev_growth
+            realized_demand = prior_actual_sales * growth_draw
 
+        planned_sales_list.append(expected_sales_target)
+
+        # 2) Planned production
         planned_prod = mults[yr] * expected_sales_target
 
         if use_max_carry and max_carryover > 0.0 and carryover >= max_carryover:
@@ -666,15 +822,22 @@ def simulate_one_run(data, planned_sales, actual_sales, archetype, rng, mults, u
         if use_floor and planned_prod > 0.0:
             planned_prod = max(planned_prod, min_floor)
 
+        # 3) Actual production
         new_prod = planned_prod * y_draw * c_draw
 
         prod_loss = new_prod * 0.02
         carry_loss = carryover * 0.10
 
+        # 4) Total saleable inventory
         total_saleable = (carryover - carry_loss) + (new_prod - prod_loss)
-        remaining = total_saleable - actual_sales[yr]
 
-        missed = max(0.0, -remaining)
+        # 5) Actual sales & inventory constraint
+        actual_sales_yr = min(realized_demand, total_saleable)
+        actual_sales_list.append(actual_sales_yr)
+
+        remaining = total_saleable - actual_sales_yr
+
+        missed = max(0.0, realized_demand - total_saleable)
         missed_sales.append(missed)
 
         rows.append([
@@ -684,9 +847,10 @@ def simulate_one_run(data, planned_sales, actual_sales, archetype, rng, mults, u
             new_prod,
             -prod_loss,
             total_saleable,
-            planned_sales[yr],
-            actual_sales[yr],
+            expected_sales_target,
+            actual_sales_yr,
             remaining,
+            missed,
         ])
         carryover = remaining
 
@@ -739,32 +903,28 @@ def build_lifecycle_sim(data, products, iterations, seed, strategy, custom_slide
         "Total saleable inventory",
         "Planned Sales",
         "Actual Sales",
-        "Remaining inventory [negative = stockout]",
+        "Remaining inventory [0 = depleted]",
+        "Unmet demand (lost sales)",
     ]
 
     thr = float(threshold)
 
-    def _row_stats(arr):
+    def _row_stats(rem_arr, missed_arr):
         return {
-            "Mean remaining": float(arr.mean()),
-            "Median remaining": float(np.median(arr)),
-            "P90 remaining": float(np.percentile(arr, 90)),
-            "P(remaining > 0)": float((arr > 0).mean()),
-            f"P(remaining > {thr:.0f})": float((arr > thr).mean()),
-            "P(stockout)": float((arr < 0).mean()),
+            "Mean remaining": float(rem_arr.mean()),
+            "Median remaining": float(np.median(rem_arr)),
+            "P90 remaining": float(np.percentile(rem_arr, 90)),
+            "P(remaining > 0)": float((rem_arr > 0).mean()),
+            f"P(remaining > {thr:.0f})": float((rem_arr > thr).mean()),
+            "P(depleted)": float((rem_arr <= 0).mean()),
+            "P(unmet demand > 0)": float((missed_arr > 0).mean()),
         }
 
     for arch, maturity in parsed:
-        # 1) Derive deterministic planned sales curve for generation runs
-        planned_sales = build_planned_sales_curve(data, arch, maturity)
-        if planned_sales is None:
-            planned_sales = np.zeros(10)
-            
         prod_rows = []
         for _ in range(int(iterations)):
-            actual_sales = draw_sales_curve(data, arch, maturity, rng)
             rows, _ = simulate_one_run(
-                data, planned_sales, actual_sales, arch, rng, mults,
+                data, arch, maturity, rng, mults,
                 use_floor, min_floor, use_max_carry, max_carryover, strategy
             )
             prod_rows.append(rows)
@@ -775,14 +935,15 @@ def build_lifecycle_sim(data, products, iterations, seed, strategy, custom_slide
         df_prod = pd.DataFrame(prod_median.T, columns=cols, index=idx_labels)
         
         rem_prod = prod_rows[:, :, 8]
+        miss_prod = prod_rows[:, :, 9]
         sales_prod = df_prod.loc["Actual Sales"].astype(float).values
         ay_prod = int(np.where(sales_prod > 0)[0][-1]) if len(np.where(sales_prod > 0)[0]) else 9
         if year_mode != "last_sales":
             ay_prod = custom_year_idx
 
         prod_summary_df = pd.DataFrame.from_dict({
-            f"Selected year (Year {ay_prod + 1})": _row_stats(rem_prod[:, ay_prod]),
-            "End of lifecycle (Year 10)": _row_stats(rem_prod[:, 9]),
+            f"Selected year (Year {ay_prod + 1})": _row_stats(rem_prod[:, ay_prod], miss_prod[:, ay_prod]),
+            "End of lifecycle (Year 10)": _row_stats(rem_prod[:, 9], miss_prod[:, 9]),
         }, orient="index")
         
         product_results.append((arch, maturity, df_prod, prod_summary_df))
@@ -797,13 +958,16 @@ def build_lifecycle_sim(data, products, iterations, seed, strategy, custom_slide
     )
 
     remaining_all = run_rows[:, :, 8]
+    missed_all = run_rows[:, :, 9]
     ay_idx = determine_analysis_year(lifecycle_df, year_mode, custom_year_idx)
 
     sel_rem = remaining_all[:, ay_idx]
+    sel_miss = missed_all[:, ay_idx]
     end_rem = remaining_all[:, 9]
+    end_miss = missed_all[:, 9]
 
-    selected_stats = _row_stats(sel_rem)
-    end_stats = _row_stats(end_rem)
+    selected_stats = _row_stats(sel_rem, sel_miss)
+    end_stats = _row_stats(end_rem, end_miss)
 
     summary_df = pd.DataFrame.from_dict(
         {
@@ -854,17 +1018,18 @@ def run_multiyear_launch_sim(data, launch_plan_df, iterations, seed, strategy, c
 
     thr = float(threshold)
 
-    def _row_stats(arr):
+    def _row_stats(rem_arr, missed_arr):
         return {
-            "Mean remaining": float(arr.mean()),
-            "Median remaining": float(np.median(arr)),
-            "P90 remaining": float(np.percentile(arr, 90)),
-            "P(remaining > 0)": float((arr > 0).mean()),
-            f"P(remaining > {thr:.0f})": float((arr > thr).mean()),
-            "P(stockout)": float((arr < 0).mean()),
+            "Mean remaining": float(rem_arr.mean()),
+            "Median remaining": float(np.median(rem_arr)),
+            "P90 remaining": float(np.percentile(rem_arr, 90)),
+            "P(remaining > 0)": float((rem_arr > 0).mean()),
+            f"P(remaining > {thr:.0f})": float((rem_arr > thr).mean()),
+            "P(depleted)": float((rem_arr <= 0).mean()),
+            "P(unmet demand > 0)": float((missed_arr > 0).mean()),
         }
 
-    all_runs = np.zeros((int(iterations), horizon_years, 9), dtype=float)
+    all_runs = np.zeros((int(iterations), horizon_years, 10), dtype=float)
     unique_products = sorted({(arch, mat) for (arch, mat, _, _) in cohorts})
     product_results = []
     
@@ -878,26 +1043,21 @@ def run_multiyear_launch_sim(data, launch_plan_df, iterations, seed, strategy, c
         "Total saleable inventory",
         "Planned Sales",
         "Actual Sales",
-        "Remaining inventory [negative = stockout]",
+        "Remaining inventory [0 = depleted]",
+        "Unmet demand (lost sales)",
     ]
 
     for arch, mat in unique_products:
         base_runs = []
-        # 1) Derive deterministic planned sales curve for generation runs
-        planned_sales = build_planned_sales_curve(data, arch, mat)
-        if planned_sales is None:
-            planned_sales = np.zeros(10)
-            
         for _ in range(int(iterations)):
-            actual_sales = draw_sales_curve(data, arch, mat, rng)
             rows, _ = simulate_one_run(
-                data, planned_sales, actual_sales, arch, rng, mults,
+                data, arch, mat, rng, mults,
                 use_floor, min_floor, use_max_carry, max_carryover, strategy
             )
             base_runs.append(rows)
         base_runs = np.stack(base_runs, axis=0)
 
-        prod_all = np.zeros((int(iterations), horizon_years, 9), dtype=float)
+        prod_all = np.zeros((int(iterations), horizon_years, 10), dtype=float)
         for _, _, launch_year, n_products in [c for c in cohorts if c[0] == arch and c[1] == mat]:
             for _ in range(n_products):
                 for it in range(int(iterations)):
@@ -912,12 +1072,13 @@ def run_multiyear_launch_sim(data, launch_plan_df, iterations, seed, strategy, c
         df_prod = pd.DataFrame(prod_median.T, columns=year_cols, index=idx_labels)
         
         rem_prod = prod_all[:, :, 8]
+        miss_prod = prod_all[:, :, 9]
         sales_prod = df_prod.loc["Actual Sales"].astype(float).values
         ay_prod = int(np.where(sales_prod > 0)[0][-1]) if len(np.where(sales_prod > 0)[0]) else horizon_years - 1
         
         prod_summary_df = pd.DataFrame.from_dict({
-            f"Last sales year (Year {ay_prod + 1})": _row_stats(rem_prod[:, ay_prod]),
-            f"End of horizon (Year {horizon_years})": _row_stats(rem_prod[:, -1]),
+            f"Last sales year (Year {ay_prod + 1})": _row_stats(rem_prod[:, ay_prod], miss_prod[:, ay_prod]),
+            f"End of horizon (Year {horizon_years})": _row_stats(rem_prod[:, -1], miss_prod[:, -1]),
         }, orient="index")
         
         product_results.append((arch, mat, df_prod, prod_summary_df))
@@ -930,14 +1091,15 @@ def run_multiyear_launch_sim(data, launch_plan_df, iterations, seed, strategy, c
     )
 
     remaining_all = all_runs[:, :, 8]
+    missed_all = all_runs[:, :, 9]
     sales_row = lifecycle_df.loc["Actual Sales"].astype(float).values
     s_idx = np.where(sales_row > 0)[0]
     ay_idx = int(s_idx[-1]) if len(s_idx) else horizon_years - 1
 
     summary_df = pd.DataFrame.from_dict(
         {
-            f"Last sales year (Year {ay_idx + 1})": _row_stats(remaining_all[:, ay_idx]),
-            f"End of horizon (Year {horizon_years})": _row_stats(remaining_all[:, -1]),
+            f"Last sales year (Year {ay_idx + 1})": _row_stats(remaining_all[:, ay_idx], missed_all[:, ay_idx]),
+            f"End of horizon (Year {horizon_years})": _row_stats(remaining_all[:, -1], missed_all[:, -1]),
         },
         orient="index",
     )
@@ -1198,7 +1360,18 @@ def _render_chart_view(lifecycle_df, year_order):
     )
     st.altair_chart(wf_chart, use_container_width=True)
 
-def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params, product_results=None):
+def render_explanation(explain_obj):
+    if not isinstance(explain_obj, dict):
+        if isinstance(explain_obj, str): # Legacy catch
+            st.markdown(f"**AI interpretation:**\n{explain_obj}")
+        return
+    if explain_obj.get("text"):
+        st.markdown(f"**AI interpretation:**\n{explain_obj['text']}")
+    config = get_llm_config()
+    if config["debug"] and explain_obj.get("_debug_reason"):
+        st.caption(f"Debug: AI fallback used. Reason: {explain_obj['_debug_reason']}")
+
+def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params, product_results=None, explanations=None):
     """Render simulation results in the main area."""
 
     # Warnings
@@ -1225,39 +1398,46 @@ def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params, p
     with tab1:
         if product_results:
             for arch, mat, df_prod, summary_prod in product_results:
+                key = f"{arch} | Maturity {mat}"
                 if params.get("mode") == "multi":
-                    with st.expander(f"{arch} | Maturity {mat}", expanded=True):
+                    with st.expander(key, expanded=True):
                         st.dataframe(df_prod.round(1), use_container_width=True)
                         st.dataframe(summary_prod.round(3), use_container_width=True)
                         # AI interpretation for each individual product
-                        explain_table(df_prod, f"{arch} | Maturity {mat} lifecycle")
+                        if explanations and key in explanations.get("product_results", {}):
+                            render_explanation(explanations['product_results'][key])
                 else:
-                    st.subheader(f"{arch} | Maturity {mat}")
+                    st.subheader(key)
                     st.dataframe(df_prod.round(1), use_container_width=True)
                     st.dataframe(summary_prod.round(3), use_container_width=True)
                     # AI interpretation for each individual product (single mode)
-                    explain_table(df_prod, f"{arch} | Maturity {mat} lifecycle")
+                    if explanations and key in explanations.get("product_results", {}):
+                        render_explanation(explanations['product_results'][key])
 
             if len(product_results) > 1:
                 st.subheader("Portfolio Aggregate")
                 st.dataframe(lifecycle_df.round(1), use_container_width=True)
-                explain_table(lifecycle_df, "Portfolio aggregate lifecycle")
+                if explanations and "lifecycle" in explanations:
+                    render_explanation(explanations['lifecycle'])
 
-                st.subheader("Portfolio Inventory Probability Summary")
+                st.subheader("Portfolio Remaining Inventory Summary")
                 st.dataframe(summary_df.round(3), use_container_width=True)
-                explain_table(summary_df, "Portfolio aggregate probability summary")
+                if explanations and "summary" in explanations:
+                    render_explanation(explanations['summary'])
         else:
-            st.subheader("Representative Lifecycle Track (1 Stochastic Run)")
+            st.subheader("Sample Lifecycle Track (1 Stochastic Run)")
             st.dataframe(lifecycle_df.round(1), use_container_width=True)
-            explain_table(lifecycle_df, "Representative lifecycle stochastic run")
+            if explanations and "lifecycle" in explanations:
+                render_explanation(explanations['lifecycle'])
 
-            st.subheader("Inventory Probability Summary")
+            st.subheader("Remaining Inventory Summary")
             st.dataframe(summary_df.round(3), use_container_width=True)
-            explain_table(summary_df, "Global probability summary")
+            if explanations and "summary" in explanations:
+                render_explanation(explanations['summary'])
 
-        st.subheader("Representative Remaining Inventory by Year (Aggregate)")
-        if "Remaining inventory [negative = stockout]" in lifecycle_df.index:
-            remaining_row = lifecycle_df.loc["Remaining inventory [negative = stockout]"]
+        st.subheader("Remaining Inventory by Year")
+        if "Remaining inventory [0 = depleted]" in lifecycle_df.index:
+            remaining_row = lifecycle_df.loc["Remaining inventory [0 = depleted]"]
             chart_df = pd.DataFrame(
                 {
                     "Year": year_order,
@@ -1282,6 +1462,18 @@ def main():
         page_title="Monte Carlo Inventory Planner",
         page_icon="📦",
         layout="wide",
+    )
+
+    st.markdown(
+        """
+        <style>
+        section[data-testid="stSidebar"] {
+            min-width: 290px;
+            max-width: 330px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
     )
 
     st.title("Monte Carlo Production & Inventory Planner")
@@ -1319,7 +1511,7 @@ def main():
         st.stop()
 
     # ── Optional file uploads (override secrets / local defaults) ───────────
-    with st.sidebar.expander("📂 Upload data files (optional)", expanded=False):
+    with st.expander("📂 Upload data files (optional)", expanded=False):
         st.markdown(
             "Upload your own `.xlsx` files to override the default data. "
             "Files must follow the same sheet and column structure as the originals. "
@@ -1466,6 +1658,7 @@ def main():
                     params["threshold"],
                 )
                 parsed = []
+        
         st.session_state["results"] = {
             "lifecycle_df": lifecycle_df,
             "summary_df": summary_df,
@@ -1474,6 +1667,8 @@ def main():
             "warnings": warnings,
             "params": params,
             "product_results": product_results,
+            "explanations": {},
+            "ai_pending": True,
         }
 
     if "results" in st.session_state:
@@ -1490,7 +1685,16 @@ def main():
                 r["warnings"],
                 r["params"],
                 r.get("product_results", None),
+                r.get("explanations", None),
             )
+            
+            if r.get("ai_pending", False):
+                with st.spinner("Finalizing AI interpretation..."):
+                    time.sleep(2)
+                    explanations = generate_all_explanations(r["lifecycle_df"], r["summary_df"], r.get("product_results", None))
+                    r["explanations"] = explanations
+                    r["ai_pending"] = False
+                st.rerun()
 
 
 if __name__ == "__main__":
