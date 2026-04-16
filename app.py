@@ -108,7 +108,33 @@ def build_fallback_explanation(df, context_text=""):
     """Local rule-based fallback interpretation when external API fails."""
     lines = []
     
-    if "P(depleted)" in df.columns or "Mean remaining" in df.columns:
+    if "Strategy" in df.columns:
+        try:
+            best_sales_idx = df["Mean total actual sales"].idxmax()
+            best_sales = df.loc[best_sales_idx, "Strategy"]
+            best_sales_val = df.loc[best_sales_idx, "Mean total actual sales"]
+            
+            best_rem_idx = df["Mean remaining inventory"].idxmin()
+            best_rem = df.loc[best_rem_idx, "Strategy"]
+            best_rem_val = df.loc[best_rem_idx, "Mean remaining inventory"]
+            
+            lines.append(f"Across the evaluated strategies, **{best_sales}** generates the highest mean actual sales ({best_sales_val:,.0f} units), prioritizing revenue capture.")
+            lines.append(f"Conversely, **{best_rem}** carries the lowest mean remaining inventory ({best_rem_val:,.0f} units), minimizing absolute obsolescence risks.")
+            
+            if best_sales != best_rem:
+                lines.append(f"A structural tradeoff is evident: moving toward **{best_sales}** materially increases revenue probability, but substantially exposes the cycle to expected carryover.")
+            else:
+                lines.append(f"**{best_sales}** appears broadly dominant, optimizing both total sales bandwidth and residual inventory clearance simultaneously within these parameters.")
+                
+            max_deplete = df["P(depleted)"].max()
+            if max_deplete > 0.1:
+                lines.append(f"Aggressive growth parameterizations must be carefully weighed against stock-out consequences, as depletion probabilities fluctuate up to {max_deplete*100:.1f}%.")
+            else:
+                lines.append("System depletion risks remain functionally suppressed across all strategy matrices, indicating sufficient safety buffers regardless of tuning constraints.")
+        except Exception:
+            lines.append("Stochastic modeling across the requested strategy permutations reveals distinctive tradeoffs between gross sales capture and terminal inventory carryover.")
+
+    elif "P(depleted)" in df.columns or "Mean remaining inventory" in df.columns:
         # It's a summary table
         # 1. Production/General 
         lines.append(f"Aggregate probabilistic models for {context_text} demonstrate varying degrees of supply constraint and operational buffering across the simulated periods.")
@@ -125,19 +151,9 @@ def build_fallback_explanation(df, context_text=""):
         else:
             lines.append("Inventory buffers remain highly robust across the entire horizon, effectively minimizing the risk of total depletion.")
             
-        # 3. Unmet Demand
-        max_unmet = 0
-        if "P(unmet demand > 0)" in df.columns:
-            max_unmet = df["P(unmet demand > 0)"].max()
-            
-        if max_unmet > 0.1:
-            lines.append(f"Frequent depletion with unmet demand indicates the strategy may be under-producing relative to realized demand, leading to lost sales opportunities (probability up to {max_unmet*100:.1f}%).")
-        else:
-            lines.append("Sales are fulfilled in most simulated scenarios, suggesting the strategy is generally meeting demand.")
-            
-        # 4. Lifecycle Risk / Horizon (Mean Remaining)
-        if "Mean remaining" in df.columns:
-            end_mean = df["Mean remaining"].iloc[-1]
+        # 3. Lifecycle Risk / Horizon (Mean Remaining)
+        if "Mean remaining inventory" in df.columns:
+            end_mean = df["Mean remaining inventory"].iloc[-1]
             if end_mean > 0:
                 lines.append(f"Positive ending inventory (averaging {end_mean:,.0f} units) suggests some residual overbuild or obsolescence risk that should be monitored.")
             else:
@@ -205,7 +221,7 @@ def build_fallback_explanation(df, context_text=""):
     clean_lines = [x.strip() for x in lines if x and str(x).strip()]
     return "\n".join(f"- {x}" for x in clean_lines)
 
-def explain_table(df, context_text=""):
+def explain_table(df, context_text="", custom_prompt=None):
     """Builds a JSON payload from a DataFrame and returns a dictionary with text and debug strings."""
     config = get_llm_config()
     
@@ -215,7 +231,11 @@ def explain_table(df, context_text=""):
     try:
         # Build compact payload representation of the dataframe
         df_json = df.to_json(orient="split")
-        prompt = f"""
+        
+        if custom_prompt:
+            prompt = custom_prompt
+        else:
+            prompt = f"""
 Provide exactly 4 markdown bullet points interpreting this Monte Carlo simulation table for a business audience.
 
 Context: {context_text}
@@ -767,8 +787,6 @@ def simulate_one_run(data, archetype, maturity, rng, mults, use_floor, min_floor
       mults         -- 10 production multipliers
 ...
     """
-    y_draw, c_draw = sample_yield_conv_normal(data, archetype, rng)
-
     carryover = 0.0
     rows = []
     missed_sales = []
@@ -823,6 +841,7 @@ def simulate_one_run(data, archetype, maturity, rng, mults, use_floor, min_floor
             planned_prod = max(planned_prod, min_floor)
 
         # 3) Actual production
+        y_draw, c_draw = sample_yield_conv_normal(data, archetype, rng)
         new_prod = planned_prod * y_draw * c_draw
 
         prod_loss = new_prod * 0.02
@@ -855,6 +874,22 @@ def simulate_one_run(data, archetype, maturity, rng, mults, use_floor, min_floor
         carryover = remaining
 
     return np.array(rows, dtype=float), np.array(missed_sales, dtype=float)
+
+def compute_summary_metrics(rem_arr, total_sales_arr, threshold):
+    """Shared summary metric helper for single and multi-year setups."""
+    thr = float(threshold)
+    stats = {}
+    if total_sales_arr is not None:
+        stats["Mean total actual sales"] = float(total_sales_arr.mean())
+        stats["Median total actual sales"] = float(np.median(total_sales_arr))
+        
+    stats["Mean remaining inventory"] = float(rem_arr.mean())
+    stats["Median remaining inventory"] = float(np.median(rem_arr))
+    stats[f"P(remaining > {thr:.0f})"] = float((rem_arr > thr).mean())
+    stats["P(depleted)"] = float((rem_arr <= 0).mean())
+    
+    return stats
+
 
 
 def determine_analysis_year(lifecycle_df, year_mode, custom_year_idx):
@@ -909,17 +944,6 @@ def build_lifecycle_sim(data, products, iterations, seed, strategy, custom_slide
 
     thr = float(threshold)
 
-    def _row_stats(rem_arr, missed_arr):
-        return {
-            "Mean remaining": float(rem_arr.mean()),
-            "Median remaining": float(np.median(rem_arr)),
-            "P90 remaining": float(np.percentile(rem_arr, 90)),
-            "P(remaining > 0)": float((rem_arr > 0).mean()),
-            f"P(remaining > {thr:.0f})": float((rem_arr > thr).mean()),
-            "P(depleted)": float((rem_arr <= 0).mean()),
-            "P(unmet demand > 0)": float((missed_arr > 0).mean()),
-        }
-
     for arch, maturity in parsed:
         prod_rows = []
         for _ in range(int(iterations)):
@@ -941,9 +965,10 @@ def build_lifecycle_sim(data, products, iterations, seed, strategy, custom_slide
         if year_mode != "last_sales":
             ay_prod = custom_year_idx
 
+        total_sales_prod = prod_rows[:, :, 7].sum(axis=1)
         prod_summary_df = pd.DataFrame.from_dict({
-            f"Selected year (Year {ay_prod + 1})": _row_stats(rem_prod[:, ay_prod], miss_prod[:, ay_prod]),
-            "End of lifecycle (Year 10)": _row_stats(rem_prod[:, 9], miss_prod[:, 9]),
+            f"Selected year (Year {ay_prod + 1})": compute_summary_metrics(rem_prod[:, ay_prod], total_sales_prod, threshold),
+            "End of lifecycle (Year 10)": compute_summary_metrics(rem_prod[:, 9], total_sales_prod, threshold),
         }, orient="index")
         
         product_results.append((arch, maturity, df_prod, prod_summary_df))
@@ -965,9 +990,10 @@ def build_lifecycle_sim(data, products, iterations, seed, strategy, custom_slide
     sel_miss = missed_all[:, ay_idx]
     end_rem = remaining_all[:, 9]
     end_miss = missed_all[:, 9]
+    total_sales_all = run_rows[:, :, 7].sum(axis=1)
 
-    selected_stats = _row_stats(sel_rem, sel_miss)
-    end_stats = _row_stats(end_rem, end_miss)
+    selected_stats = compute_summary_metrics(sel_rem, total_sales_all, threshold)
+    end_stats = compute_summary_metrics(end_rem, total_sales_all, threshold)
 
     summary_df = pd.DataFrame.from_dict(
         {
@@ -1018,17 +1044,6 @@ def run_multiyear_launch_sim(data, launch_plan_df, iterations, seed, strategy, c
 
     thr = float(threshold)
 
-    def _row_stats(rem_arr, missed_arr):
-        return {
-            "Mean remaining": float(rem_arr.mean()),
-            "Median remaining": float(np.median(rem_arr)),
-            "P90 remaining": float(np.percentile(rem_arr, 90)),
-            "P(remaining > 0)": float((rem_arr > 0).mean()),
-            f"P(remaining > {thr:.0f})": float((rem_arr > thr).mean()),
-            "P(depleted)": float((rem_arr <= 0).mean()),
-            "P(unmet demand > 0)": float((missed_arr > 0).mean()),
-        }
-
     all_runs = np.zeros((int(iterations), horizon_years, 10), dtype=float)
     unique_products = sorted({(arch, mat) for (arch, mat, _, _) in cohorts})
     product_results = []
@@ -1076,9 +1091,10 @@ def run_multiyear_launch_sim(data, launch_plan_df, iterations, seed, strategy, c
         sales_prod = df_prod.loc["Actual Sales"].astype(float).values
         ay_prod = int(np.where(sales_prod > 0)[0][-1]) if len(np.where(sales_prod > 0)[0]) else horizon_years - 1
         
+        total_sales_prod = prod_all[:, :, 7].sum(axis=1)
         prod_summary_df = pd.DataFrame.from_dict({
-            f"Last sales year (Year {ay_prod + 1})": _row_stats(rem_prod[:, ay_prod], miss_prod[:, ay_prod]),
-            f"End of horizon (Year {horizon_years})": _row_stats(rem_prod[:, -1], miss_prod[:, -1]),
+            f"Last sales year (Year {ay_prod + 1})": compute_summary_metrics(rem_prod[:, ay_prod], total_sales_prod, threshold),
+            f"End of horizon (Year {horizon_years})": compute_summary_metrics(rem_prod[:, -1], total_sales_prod, threshold),
         }, orient="index")
         
         product_results.append((arch, mat, df_prod, prod_summary_df))
@@ -1096,10 +1112,11 @@ def run_multiyear_launch_sim(data, launch_plan_df, iterations, seed, strategy, c
     s_idx = np.where(sales_row > 0)[0]
     ay_idx = int(s_idx[-1]) if len(s_idx) else horizon_years - 1
 
+    total_sales_all = all_runs[:, :, 7].sum(axis=1)
     summary_df = pd.DataFrame.from_dict(
         {
-            f"Last sales year (Year {ay_idx + 1})": _row_stats(remaining_all[:, ay_idx], missed_all[:, ay_idx]),
-            f"End of horizon (Year {horizon_years})": _row_stats(remaining_all[:, -1], missed_all[:, -1]),
+            f"Last sales year (Year {ay_idx + 1})": compute_summary_metrics(remaining_all[:, ay_idx], total_sales_all, threshold),
+            f"End of horizon (Year {horizon_years})": compute_summary_metrics(remaining_all[:, -1], total_sales_all, threshold),
         },
         orient="index",
     )
@@ -1401,14 +1418,14 @@ def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params, p
                 key = f"{arch} | Maturity {mat}"
                 if params.get("mode") == "multi":
                     with st.expander(key, expanded=True):
-                        st.dataframe(df_prod.round(1), use_container_width=True)
+                        st.dataframe(df_prod.drop(["Unmet demand (lost sales)"], errors="ignore").round(1), use_container_width=True)
                         st.dataframe(summary_prod.round(3), use_container_width=True)
                         # AI interpretation for each individual product
                         if explanations and key in explanations.get("product_results", {}):
                             render_explanation(explanations['product_results'][key])
                 else:
                     st.subheader(key)
-                    st.dataframe(df_prod.round(1), use_container_width=True)
+                    st.dataframe(df_prod.drop(["Unmet demand (lost sales)"], errors="ignore").round(1), use_container_width=True)
                     st.dataframe(summary_prod.round(3), use_container_width=True)
                     # AI interpretation for each individual product (single mode)
                     if explanations and key in explanations.get("product_results", {}):
@@ -1416,7 +1433,7 @@ def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params, p
 
             if len(product_results) > 1:
                 st.subheader("Portfolio Aggregate")
-                st.dataframe(lifecycle_df.round(1), use_container_width=True)
+                st.dataframe(lifecycle_df.drop(["Unmet demand (lost sales)"], errors="ignore").round(1), use_container_width=True)
                 if explanations and "lifecycle" in explanations:
                     render_explanation(explanations['lifecycle'])
 
@@ -1426,7 +1443,7 @@ def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params, p
                     render_explanation(explanations['summary'])
         else:
             st.subheader("Sample Lifecycle Track (1 Stochastic Run)")
-            st.dataframe(lifecycle_df.round(1), use_container_width=True)
+            st.dataframe(lifecycle_df.drop(["Unmet demand (lost sales)"], errors="ignore").round(1), use_container_width=True)
             if explanations and "lifecycle" in explanations:
                 render_explanation(explanations['lifecycle'])
 
@@ -1434,6 +1451,8 @@ def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params, p
             st.dataframe(summary_df.round(3), use_container_width=True)
             if explanations and "summary" in explanations:
                 render_explanation(explanations['summary'])
+                
+
 
         st.subheader("Remaining Inventory by Year")
         if "Remaining inventory [0 = depleted]" in lifecycle_df.index:
@@ -1570,6 +1589,7 @@ def main():
     # ── Main Area Configuration ──────────────────────────────────────────────
     
     # Render main content layout conditionally
+    comp_clicked = False
     if params["mode"] == "multi":
         st.subheader("Multi-year Launch Cohorts")
         if not params["products"]:
@@ -1626,6 +1646,8 @@ def main():
         run_clicked = st.button(button_text, type="primary")
 
     if run_clicked:
+        st.session_state["comparison_df"] = None
+        st.session_state["comparison_explanation"] = None
         with st.spinner("Running Monte Carlo simulation..."):
             if params["mode"] == "single":
                 lifecycle_df, summary_df, ay_idx, parsed, warnings, product_results = build_lifecycle_sim(
@@ -1696,6 +1718,82 @@ def main():
                     r["ai_pending"] = False
                 st.rerun()
 
+            st.divider()
+            if "comparison_df" not in st.session_state or st.session_state["comparison_df"] is None:
+                if st.button("Compare Strategies", type="secondary", help="Generate a strategy tradeoff summary table using identically seeded inputs."):
+                    with st.spinner("Running strategy comparison..."):
+                        comp_rows = []
+                        for s_name, s_id in [("Just-in-time 1.0x", "jit"), ("Conservative 1.2x", "cons"), ("Aggressive 2.0x", "aggr")]:
+                            if params["mode"] == "single":
+                                _, summary_df, ay_idx, _, _, _ = build_lifecycle_sim(
+                                    data, params["products"], params["iterations"], params["seed"],
+                                    s_id, params["custom_sliders"], params["use_floor"], params["min_floor"],
+                                    params["use_max_carry"], params["max_carryover"], params["year_mode"],
+                                    params["custom_year_idx"], params["threshold"]
+                                )
+                                sel_row_name = f"Selected year (Year {ay_idx + 1})"
+                            else:
+                                _, summary_df, ay_idx, _, _ = run_multiyear_launch_sim(
+                                    data, params["launch_plan_df"], params["iterations"], params["seed"],
+                                    s_id, params["custom_sliders"], params["use_floor"], params["min_floor"],
+                                    params["use_max_carry"], params["max_carryover"], params["threshold"]
+                                )
+                                sel_row_name = f"Last sales year (Year {ay_idx + 1})"
+                            
+                            row_data = {
+                                "Strategy": s_name,
+                                "Mean total actual sales": summary_df.loc[sel_row_name, "Mean total actual sales"],
+                                "Median total actual sales": summary_df.loc[sel_row_name, "Median total actual sales"],
+                                "Mean remaining inventory": summary_df.loc[sel_row_name, "Mean remaining inventory"],
+                                "Median remaining inventory": summary_df.loc[sel_row_name, "Median remaining inventory"],
+                                f"P(remaining > {params['threshold']:.0f})": summary_df.loc[sel_row_name, f"P(remaining > {params['threshold']:.0f})"],
+                                "P(depleted)": summary_df.loc[sel_row_name, "P(depleted)"],
+                            }
+                            comp_rows.append(row_data)
+                        comp_df = pd.DataFrame(comp_rows)
+                        st.session_state["comparison_df"] = comp_df
+                        
+                        conf = get_llm_config()
+                        if conf.get("enable", True):
+                            best_sales = comp_df.loc[comp_df["Mean total actual sales"].idxmax(), "Strategy"]
+                            best_sales_val = comp_df["Mean total actual sales"].max()
+                            
+                            best_rem = comp_df.loc[comp_df["Mean remaining inventory"].idxmin(), "Strategy"]
+                            best_rem_val = comp_df["Mean remaining inventory"].min()
+                            
+                            custom_prompt = f"""
+Provide exactly 4 markdown bullet points explicitly comparing the strategies in this Monte Carlo tradeoff table.
+Context: Strategy tradeoff comparison focusing on actual sales versus depletion/obsolescence risk.
+Table data: {comp_df.to_json(orient='split')}
+
+IMPORTANT:
+- Ensure each bullet explicitly names specific strategies (e.g. 'Just-in-time 1.0x', 'Conservative 1.2x', 'Aggressive 2.0x').
+- Discuss how they differ on 'Mean total actual sales' and 'Mean remaining inventory' or 'P(depleted)'.
+- Explicitly note that '{best_sales}' has the highest mean actual sales ({best_sales_val:,.0f}).
+- Explicitly note that '{best_rem}' has the lowest mean remaining inventory ({best_rem_val:,.0f}).
+- Mention which strategy appears to offer the most balanced tradeoff between high sales and low obsolescence risk.
+- Do not use generic single-strategy depletion language. You must compare them against each other.
+- Output bullet points only, with each bullet on its own line.
+- Do not use dollar signs or currency symbols.
+"""
+                            st.session_state["comparison_explanation"] = explain_table(comp_df, custom_prompt=custom_prompt)
+                    st.rerun()
+            else:
+                st.subheader("Strategy Comparison")
+                st.markdown("Tradeoff analysis across fixed strategy tiers using identical assumptions.")
+                comp_df = st.session_state["comparison_df"]
+                st.dataframe(comp_df, use_container_width=True)
+                csv = comp_df.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="Download Comparison as CSV",
+                    data=csv,
+                    file_name='strategy_comparison.csv',
+                    mime='text/csv',
+                )
+                
+                exp = st.session_state.get("comparison_explanation")
+                if exp:
+                    render_explanation(exp)
 
 if __name__ == "__main__":
     main()
