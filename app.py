@@ -793,6 +793,7 @@ def simulate_one_run(data, archetype, maturity, rng, mults, use_floor, min_floor
     
     actual_sales_list = []
     planned_sales_list = []
+    prior_demand = 0.0
 
     for yr in range(10):
         # 1) Determine planned sales and realized demand
@@ -804,13 +805,15 @@ def simulate_one_run(data, archetype, maturity, rng, mults, use_floor, min_floor
                 fy_sigma = float(np.sqrt(max(fy_sig2, 1e-10)))
                 y1_demand = float(rng.lognormal(fy_mu, fy_sigma))
                 expected_sales_target = ev_y1
-                realized_demand = y1_demand
+                prior_demand = y1_demand
+                realized_demand = prior_demand
             else:
                 val = get_median_sales(data, archetype, maturity) or 0.0
                 expected_sales_target = val
-                realized_demand = val
+                prior_demand = val
+                realized_demand = prior_demand
         else:
-            prior_actual_sales = actual_sales_list[-1]
+            prior_expected = planned_sales_list[-1]
             gr_mu = data["sv_gr_mu"].get((archetype, maturity, yr + 1))
             gr_sig2 = data["sv_gr_sig2"].get((archetype, maturity, yr + 1))
             if gr_mu is not None and gr_sig2 is not None:
@@ -826,8 +829,9 @@ def simulate_one_run(data, archetype, maturity, rng, mults, use_floor, min_floor
                     ev_growth = 0.0
                     growth_draw = 0.0
             
-            expected_sales_target = prior_actual_sales * ev_growth
-            realized_demand = prior_actual_sales * growth_draw
+            expected_sales_target = prior_expected * ev_growth
+            prior_demand = prior_demand * growth_draw
+            realized_demand = prior_demand
 
         planned_sales_list.append(expected_sales_target)
 
@@ -1202,8 +1206,6 @@ def render_sidebar(data):
         "Random seed", value=42, step=1,
         help="Fixes the random generator for reproducible results.",
     )
-
-    # (View mode toggle was removed per Patrick's instructions to use Tabs)
 
     # Analysis Year — single mode only
     year_mode = "last_sales"
