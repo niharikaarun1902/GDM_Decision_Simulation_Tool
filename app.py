@@ -851,6 +851,7 @@ def simulate_one_run(data, archetype, maturity, rng, mults, use_floor, min_floor
         total_saleable = (carryover - carry_loss) + (new_prod - prod_loss)
 
         # 5) Actual sales & inventory constraint
+        # Actual sales are realized demand capped at total saleable inventory (not capped by planned sales).
         actual_sales_yr = min(realized_demand, total_saleable)
         actual_sales_list.append(actual_sales_yr)
 
@@ -955,7 +956,7 @@ def build_lifecycle_sim(data, products, iterations, seed, strategy, custom_slide
         prod_rows = np.stack(prod_rows, axis=0)
         run_rows_all.append(prod_rows)
         
-        prod_median = prod_rows[0]
+        prod_median = np.median(prod_rows, axis=0)
         df_prod = pd.DataFrame(prod_median.T, columns=cols, index=idx_labels)
         
         rem_prod = prod_rows[:, :, 8]
@@ -974,7 +975,7 @@ def build_lifecycle_sim(data, products, iterations, seed, strategy, custom_slide
         product_results.append((arch, maturity, df_prod, prod_summary_df))
 
     run_rows = np.sum(run_rows_all, axis=0)
-    median_rows = run_rows[0]
+    median_rows = np.median(run_rows, axis=0)
 
     lifecycle_df = pd.DataFrame(
         median_rows.T,
@@ -1083,7 +1084,7 @@ def run_multiyear_launch_sim(data, launch_plan_df, iterations, seed, strategy, c
                     prod_all[it, start:end, :] += rows[:span, :]
         all_runs += prod_all
         
-        prod_median = prod_all[0]
+        prod_median = np.median(prod_all, axis=0)
         df_prod = pd.DataFrame(prod_median.T, columns=year_cols, index=idx_labels)
         
         rem_prod = prod_all[:, :, 8]
@@ -1099,7 +1100,7 @@ def run_multiyear_launch_sim(data, launch_plan_df, iterations, seed, strategy, c
         
         product_results.append((arch, mat, df_prod, prod_summary_df))
 
-    median_rows = all_runs[0]
+    median_rows = np.median(all_runs, axis=0)
     lifecycle_df = pd.DataFrame(
         median_rows.T,
         columns=year_cols,
@@ -1442,7 +1443,7 @@ def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params, p
                 if explanations and "summary" in explanations:
                     render_explanation(explanations['summary'])
         else:
-            st.subheader("Sample Lifecycle Track (1 Stochastic Run)")
+            st.subheader("Median Lifecycle Track (Across All Runs)")
             st.dataframe(lifecycle_df.drop(["Unmet demand (lost sales)"], errors="ignore").round(1), use_container_width=True)
             if explanations and "lifecycle" in explanations:
                 render_explanation(explanations['lifecycle'])
