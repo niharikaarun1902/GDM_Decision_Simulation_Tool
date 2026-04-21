@@ -793,6 +793,7 @@ def simulate_one_run(data, archetype, maturity, rng, mults, use_floor, min_floor
     
     actual_sales_list = []
     planned_sales_list = []
+    prior_demand = 0.0
 
     for yr in range(10):
         # 1) Determine planned sales and realized demand
@@ -804,13 +805,15 @@ def simulate_one_run(data, archetype, maturity, rng, mults, use_floor, min_floor
                 fy_sigma = float(np.sqrt(max(fy_sig2, 1e-10)))
                 y1_demand = float(rng.lognormal(fy_mu, fy_sigma))
                 expected_sales_target = ev_y1
-                realized_demand = y1_demand
+                prior_demand = y1_demand
+                realized_demand = prior_demand
             else:
                 val = get_median_sales(data, archetype, maturity) or 0.0
                 expected_sales_target = val
-                realized_demand = val
+                prior_demand = val
+                realized_demand = prior_demand
         else:
-            prior_actual_sales = actual_sales_list[-1]
+            prior_expected = planned_sales_list[-1]
             gr_mu = data["sv_gr_mu"].get((archetype, maturity, yr + 1))
             gr_sig2 = data["sv_gr_sig2"].get((archetype, maturity, yr + 1))
             if gr_mu is not None and gr_sig2 is not None:
@@ -826,8 +829,9 @@ def simulate_one_run(data, archetype, maturity, rng, mults, use_floor, min_floor
                     ev_growth = 0.0
                     growth_draw = 0.0
             
-            expected_sales_target = prior_actual_sales * ev_growth
-            realized_demand = prior_actual_sales * growth_draw
+            expected_sales_target = prior_expected * ev_growth
+            prior_demand = prior_demand * growth_draw
+            realized_demand = prior_demand
 
         planned_sales_list.append(expected_sales_target)
 
@@ -1004,7 +1008,7 @@ def build_lifecycle_sim(data, products, iterations, seed, strategy, custom_slide
         orient="index",
     )
 
-    return lifecycle_df, summary_df, ay_idx, parsed, warnings, product_results
+    return lifecycle_df, summary_df, ay_idx, parsed, warnings, product_results, run_rows
 
 
 def build_launch_cohorts(launch_plan_df):
@@ -1203,8 +1207,6 @@ def render_sidebar(data):
         help="Fixes the random generator for reproducible results.",
     )
 
-    # (View mode toggle was removed per Patrick's instructions to use Tabs)
-
     # Analysis Year — single mode only
     year_mode = "last_sales"
     year_mode_label = "Last Year of Sales"
@@ -1389,7 +1391,7 @@ def render_explanation(explain_obj):
     if config["debug"] and explain_obj.get("_debug_reason"):
         st.caption(f"Debug: AI fallback used. Reason: {explain_obj['_debug_reason']}")
 
-def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params, product_results=None, explanations=None):
+def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params, product_results=None, explanations=None, run_rows=None):
     """Render simulation results in the main area."""
 
     # Warnings
@@ -1470,6 +1472,109 @@ def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params, p
             )
             st.altair_chart(chart, use_container_width=True)
             
+        if params.get("mode") == "single" and run_rows is not None:
+            st.divider()
+            with st.expander("Advanced Debug: Single-Run Trace Explorer"):
+                st.markdown("Examine a specific Monte Carlo iteration to explicitly see the relationship between Planned Sales, Actual Sales, and Inventory limits before median-smoothing.")
+                
+                found_case1 = -1
+                found_case2 = -1
+                found_case3 = -1
+                
+                iterations = run_rows.shape[0]
+                for i in range(iterations):
+                    arr = run_rows[i]
+                    planned = arr[:, 6]
+                    actual = arr[:, 7]
+                    missed = arr[:, 9]
+                    supply = arr[:, 5]
+                    
+                    if found_case1 == -1 and np.any(actual <= planned):
+                        found_case1 = i
+                    if found_case2 == -1 and np.any((actual > planned) & (actual < supply) & (missed == 0)):
+                        found_case2 = i
+                    if found_case3 == -1 and np.any(missed > 0):
+                        found_case3 = i
+                        
+                    if found_case1 >= 0 and found_case2 >= 0 and found_case3 >= 0:
+                        break
+                        
+                opts = {"Run 0 (Default)": 0}
+                if found_case1 >= 0: opts["First run showing Case 1 (Actual < Planned)"] = found_case1
+                if found_case2 >= 0: opts["First run showing Case 2 (Demand beats plan, fully met)"] = found_case2
+                if found_case3 >= 0: opts["First run showing Case 3 (Supply caps demand)"] = found_case3
+                opts["Custom Run Index"] = "custom"
+                
+                chk = st.selectbox("Select trace:", list(opts.keys()))
+                if chk == "Custom Run Index":
+                    sel_idx = st.number_input("Enter Run Index", min_value=0, max_value=iterations-1, value=0, step=1)
+                else:
+                    sel_idx = opts[chk]
+                
+                tgt_arr = run_rows[sel_idx]
+                regimes = []
+                for yr in range(10):
+                    p = tgt_arr[yr, 6]
+                    a = tgt_arr[yr, 7]
+                    m = tgt_arr[yr, 9]
+                    
+                    if m > 0:
+                        regimes.append("Case 3: Supply Caps Demand")
+                    elif a > p and a < tgt_arr[yr, 5] and m == 0:
+                        regimes.append("Case 2: Planned < Actual < Supply")
+                    else:
+                        regimes.append("Case 1: Actual <= Planned")
+                        
+                trace_df = pd.DataFrame({
+                    "Planned Sales": tgt_arr[:, 6],
+                    "Actual Sales": tgt_arr[:, 7],
+                    "Total saleable inventory": tgt_arr[:, 5],
+                    "Unmet demand (lost sales)": tgt_arr[:, 9],
+                    "Regime": regimes
+                }, index=[f"Year {i+1}" for i in range(10)])
+                
+                # Format to 1 decimal place, ignoring the strings
+                styled_df = trace_df.T.copy()
+                for col in styled_df.columns:
+                    styled_df[col] = styled_df[col].apply(lambda x: f"{x:.1f}" if isinstance(x, (int, float)) else x)
+
+                st.dataframe(styled_df, use_container_width=True)
+
+                st.caption("")
+                st.markdown("##### Reproduce This Trace")
+                st.markdown("Copy or download these exact parameters to perfectly recreate this specific simulation path.")
+                
+                repro_dict = {
+                    "mode": params.get("mode"),
+                    "products": params.get("products", []),
+                    "seed": params.get("seed"),
+                    "iterations": params.get("iterations"),
+                    "strategy": params.get("strategy"),
+                    "custom_sliders": list(params.get("custom_sliders", [])),
+                    "use_floor": params.get("use_floor"),
+                    "min_floor": params.get("min_floor"),
+                    "use_max_carry": params.get("use_max_carry"),
+                    "max_carryover": params.get("max_carryover"),
+                    "threshold": params.get("threshold"),
+                    "year_mode": params.get("year_mode"),
+                    "custom_year_idx": params.get("custom_year_idx"),
+                    "trace_label": chk,
+                    "run_index": int(sel_idx)
+                }
+                
+                repro_json = json.dumps(repro_dict, indent=2)
+                
+                st.code(repro_json, language="json")
+                st.download_button(
+                    label="Download Reproducibility JSON",
+                    data=repro_json,
+                    file_name=f"trace_run_{sel_idx}.json",
+                    mime="application/json",
+                    key="repro_dl"
+                )
+
+
+
     with tab2:
         # Chart view — use full _render_chart_view with year ordering
         year_order_for_chart = list(lifecycle_df.columns)
@@ -1587,6 +1692,7 @@ def main():
         st.stop()
     params = render_sidebar(data)
 
+
     # ── Main Area Configuration ──────────────────────────────────────────────
     
     # Render main content layout conditionally
@@ -1651,7 +1757,7 @@ def main():
         st.session_state["comparison_explanation"] = None
         with st.spinner("Running Monte Carlo simulation..."):
             if params["mode"] == "single":
-                lifecycle_df, summary_df, ay_idx, parsed, warnings, product_results = build_lifecycle_sim(
+                lifecycle_df, summary_df, ay_idx, parsed, warnings, product_results, run_rows = build_lifecycle_sim(
                     data,
                     params["products"],
                     params["iterations"],
@@ -1681,6 +1787,7 @@ def main():
                     params["threshold"],
                 )
                 parsed = []
+                run_rows = None
         
         st.session_state["results"] = {
             "lifecycle_df": lifecycle_df,
@@ -1690,6 +1797,7 @@ def main():
             "warnings": warnings,
             "params": params,
             "product_results": product_results,
+            "run_rows": run_rows,
             "explanations": {},
             "ai_pending": True,
         }
@@ -1709,6 +1817,7 @@ def main():
                 r["params"],
                 r.get("product_results", None),
                 r.get("explanations", None),
+                r.get("run_rows", None),
             )
             
             if r.get("ai_pending", False):
@@ -1726,7 +1835,7 @@ def main():
                         comp_rows = []
                         for s_name, s_id in [("Just-in-time 1.0x", "jit"), ("Conservative 1.2x", "cons"), ("Aggressive 2.0x", "aggr")]:
                             if params["mode"] == "single":
-                                _, summary_df, ay_idx, _, _, _ = build_lifecycle_sim(
+                                _, summary_df, ay_idx, _, _, _, _ = build_lifecycle_sim(
                                     data, params["products"], params["iterations"], params["seed"],
                                     s_id, params["custom_sliders"], params["use_floor"], params["min_floor"],
                                     params["use_max_carry"], params["max_carryover"], params["year_mode"],
