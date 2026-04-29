@@ -1,4 +1,4 @@
-# Monte Carlo Production \& Inventory Planner
+# Monte Carlo Production \& Inventory Planner 
 
 A Streamlit dashboard for running 10-year Monte Carlo simulations of seed production and inventory across multiple products. Uses lognormal sales variability, yield \& conversion uncertainty, and portfolio-level aggregation.
 
