@@ -3,7 +3,7 @@ Monte Carlo Production & Inventory Planner (Multi-Product)
 ==========================================================
 Streamlit dashboard for 10-year Monte Carlo simulation of seed production
 and inventory, using archetype/maturity inputs, yield & conversion
-uncertainty, and portfolio-level aggregation across multiple products.
+uncertainty, and portfolio-level aggregation across multiple products. 
 
 Run with:  streamlit run app.py
 """
