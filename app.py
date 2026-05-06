@@ -38,8 +38,11 @@ def resolve_llm_setting(key, default=None):
 def get_llm_config():
     enable_str = resolve_llm_setting("ENABLE_LLM_EXPLAIN", "true")
     debug_str = resolve_llm_setting("LLM_DEBUG", "false")
+    base_enable = enable_str.lower() in ("true", "1", "yes")
+    user_enable = st.session_state.get("user_ai_toggle", True)
     return {
-        "enable": enable_str.lower() in ("true", "1", "yes"),
+        "user_enabled": user_enable,
+        "enable": base_enable,
         "debug": debug_str.lower() in ("true", "1", "yes"),
         "base_url": resolve_llm_setting("LLM_BASE_URL", None),
         "model": resolve_llm_setting("LLM_MODEL", None),
@@ -225,10 +228,13 @@ def explain_table(df, context_text="", custom_prompt=None):
     """Builds a JSON payload from a DataFrame and returns a dictionary with text and debug strings."""
     config = get_llm_config()
     
-    if not config["enable"] or not config["base_url"] or not config["model"] or not config["api_key"]:
+    if not config["user_enabled"] or not config["enable"]:
+        return {"text": None, "_debug_reason": None}
+        
+    if not config["base_url"] or not config["model"] or not config["api_key"]:
         return {
             "text": build_fallback_explanation(df, context_text),
-            "_debug_reason": "LLM disabled or missing configuration (URL, model, or API key)"
+            "_debug_reason": "LLM missing configuration (URL, model, or API key)"
         }
 
     try:
@@ -291,7 +297,7 @@ def generate_all_explanations(lifecycle_df, summary_df, product_results):
     explanations = {}
     config = get_llm_config()
     
-    if not config["enable"]:
+    if not config["enable"] or not config["user_enabled"]:
         return explanations
     
     with st.spinner("Generating AI explanations..."):
@@ -1261,6 +1267,15 @@ def render_sidebar(data):
             help="Skip production when carry-in inventory reaches this level.",
         )
 
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("AI Configuration")
+    st.sidebar.checkbox(
+        "Enable AI interpretation", 
+        value=st.session_state.get("user_ai_toggle", True), 
+        key="user_ai_toggle"
+    )
+    st.sidebar.caption("Admin note: To update the AI backend configuration, open the app’s Settings in Streamlit Community Cloud and edit the Secrets tab.")
+
     return {
         "mode": mode,
         "mode_label": mode_label,
@@ -1475,109 +1490,6 @@ def render_results(lifecycle_df, summary_df, ay_idx, parsed, warnings, params, p
             )
             st.altair_chart(chart, use_container_width=True)
             
-        if params.get("mode") == "single" and run_rows is not None:
-            st.divider()
-            with st.expander("Advanced Debug: Single-Run Trace Explorer"):
-                st.markdown("Examine a specific Monte Carlo iteration to explicitly see the relationship between Planned Sales, Actual Sales, and Inventory limits before median-smoothing.")
-                
-                found_case1 = -1
-                found_case2 = -1
-                found_case3 = -1
-                
-                iterations = run_rows.shape[0]
-                for i in range(iterations):
-                    arr = run_rows[i]
-                    planned = arr[:, 6]
-                    actual = arr[:, 7]
-                    missed = arr[:, 9]
-                    supply = arr[:, 5]
-                    
-                    if found_case1 == -1 and np.any(actual <= planned):
-                        found_case1 = i
-                    if found_case2 == -1 and np.any((actual > planned) & (actual < supply) & (missed == 0)):
-                        found_case2 = i
-                    if found_case3 == -1 and np.any(missed > 0):
-                        found_case3 = i
-                        
-                    if found_case1 >= 0 and found_case2 >= 0 and found_case3 >= 0:
-                        break
-                        
-                opts = {"Run 0 (Default)": 0}
-                if found_case1 >= 0: opts["First run showing Case 1 (Actual < Planned)"] = found_case1
-                if found_case2 >= 0: opts["First run showing Case 2 (Demand beats plan, fully met)"] = found_case2
-                if found_case3 >= 0: opts["First run showing Case 3 (Supply caps demand)"] = found_case3
-                opts["Custom Run Index"] = "custom"
-                
-                chk = st.selectbox("Select trace:", list(opts.keys()))
-                if chk == "Custom Run Index":
-                    sel_idx = st.number_input("Enter Run Index", min_value=0, max_value=iterations-1, value=0, step=1)
-                else:
-                    sel_idx = opts[chk]
-                
-                tgt_arr = run_rows[sel_idx]
-                regimes = []
-                for yr in range(10):
-                    p = tgt_arr[yr, 6]
-                    a = tgt_arr[yr, 7]
-                    m = tgt_arr[yr, 9]
-                    
-                    if m > 0:
-                        regimes.append("Case 3: Supply Caps Demand")
-                    elif a > p and a < tgt_arr[yr, 5] and m == 0:
-                        regimes.append("Case 2: Planned < Actual < Supply")
-                    else:
-                        regimes.append("Case 1: Actual <= Planned")
-                        
-                trace_df = pd.DataFrame({
-                    "Planned Sales": tgt_arr[:, 6],
-                    "Actual Sales": tgt_arr[:, 7],
-                    "Total saleable inventory": tgt_arr[:, 5],
-                    "Unmet demand (lost sales)": tgt_arr[:, 9],
-                    "Regime": regimes
-                }, index=[f"Year {i+1}" for i in range(10)])
-                
-                # Format to 1 decimal place, ignoring the strings
-                styled_df = trace_df.T.copy()
-                for col in styled_df.columns:
-                    styled_df[col] = styled_df[col].apply(lambda x: f"{x:.1f}" if isinstance(x, (int, float)) else x)
-
-                st.dataframe(styled_df, use_container_width=True)
-
-                st.caption("")
-                st.markdown("##### Reproduce This Trace")
-                st.markdown("Copy or download these exact parameters to perfectly recreate this specific simulation path.")
-                
-                repro_dict = {
-                    "mode": params.get("mode"),
-                    "products": params.get("products", []),
-                    "seed": params.get("seed"),
-                    "iterations": params.get("iterations"),
-                    "strategy": params.get("strategy"),
-                    "custom_sliders": list(params.get("custom_sliders", [])),
-                    "use_floor": params.get("use_floor"),
-                    "min_floor": params.get("min_floor"),
-                    "use_max_carry": params.get("use_max_carry"),
-                    "max_carryover": params.get("max_carryover"),
-                    "threshold": params.get("threshold"),
-                    "year_mode": params.get("year_mode"),
-                    "custom_year_idx": params.get("custom_year_idx"),
-                    "trace_label": chk,
-                    "run_index": int(sel_idx)
-                }
-                
-                repro_json = json.dumps(repro_dict, indent=2)
-                
-                st.code(repro_json, language="json")
-                st.download_button(
-                    label="Download Reproducibility JSON",
-                    data=repro_json,
-                    file_name=f"trace_run_{sel_idx}.json",
-                    mime="application/json",
-                    key="repro_dl"
-                )
-
-
-
     with tab2:
         # Chart view — use full _render_chart_view with year ordering
         year_order_for_chart = list(lifecycle_df.columns)
@@ -1867,7 +1779,7 @@ def main():
                         st.session_state["comparison_df"] = comp_df
                         
                         conf = get_llm_config()
-                        if conf.get("enable", True):
+                        if conf.get("enable", True) and conf.get("user_enabled", True):
                             best_sales = comp_df.loc[comp_df["Mean total actual sales"].idxmax(), "Strategy"]
                             best_sales_val = comp_df["Mean total actual sales"].max()
                             
@@ -1905,8 +1817,11 @@ IMPORTANT:
                 )
                 
                 exp = st.session_state.get("comparison_explanation")
-                if exp:
+                if exp and exp.get("text"):
                     render_explanation(exp)
+                    
+                    source = "Built-in fallback" if exp.get("_debug_reason") else "External AI"
+                    st.caption(f"Interpretation source: {source}")
 
 if __name__ == "__main__":
     main()
