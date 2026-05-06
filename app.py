@@ -41,8 +41,8 @@ def get_llm_config():
     return {
         "enable": enable_str.lower() in ("true", "1", "yes"),
         "debug": debug_str.lower() in ("true", "1", "yes"),
-        "base_url": resolve_llm_setting("LLM_BASE_URL", "https://genai.rcac.purdue.edu/api/chat/completions"),
-        "model": resolve_llm_setting("LLM_MODEL", "llama3.1:latest"),
+        "base_url": resolve_llm_setting("LLM_BASE_URL", None),
+        "model": resolve_llm_setting("LLM_MODEL", None),
         "api_key": resolve_llm_setting("LLM_API_KEY", None),
         "timeout": int(resolve_llm_setting("LLM_TIMEOUT", "45")),
     }
@@ -225,8 +225,11 @@ def explain_table(df, context_text="", custom_prompt=None):
     """Builds a JSON payload from a DataFrame and returns a dictionary with text and debug strings."""
     config = get_llm_config()
     
-    if not config["enable"]:
-        return {"text": None, "_debug_reason": None}
+    if not config["enable"] or not config["base_url"] or not config["model"] or not config["api_key"]:
+        return {
+            "text": build_fallback_explanation(df, context_text),
+            "_debug_reason": "LLM disabled or missing configuration (URL, model, or API key)"
+        }
 
     try:
         # Build compact payload representation of the dataframe

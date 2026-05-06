@@ -78,6 +78,18 @@ The app will open in your browser at [http://localhost:8501](http://localhost:85
    streamlit run app.py
    ```
 
+## Optional AI Interpretation
+
+The dashboard can optionally connect to any standard OpenAI-compatible `/chat/completions` endpoint to generate automated business insights on the simulation results. 
+
+To enable this feature, configure the following environment variables (or add them to `.streamlit/secrets.toml`):
+- `ENABLE_LLM_EXPLAIN`: Set to `"true"`
+- `LLM_BASE_URL`: Your chosen provider endpoint (e.g., `https://api.openai.com/v1/chat/completions`)
+- `LLM_MODEL`: The target model name (e.g., `gpt-4o-mini`)
+- `LLM_API_KEY`: Your authorization token
+
+If any of these configurations are missing or disabled, the application will gracefully skip the external API call and execute a built-in deterministic fallback engine.
+
 ## Usage
 
 1. **Select products** from the sidebar (Archetype | Maturity combinations).
