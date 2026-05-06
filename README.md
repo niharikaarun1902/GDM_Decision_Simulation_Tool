@@ -43,13 +43,81 @@ pip install -r requirements.txt
 ```
 
 
-### 3. Run the app
+### 3. Optional: Configure AI interpretation
 
+The app supports optional AI-generated interpretation for simulation outputs and strategy comparison. AI configuration is read from environment variables or Streamlit secrets at runtime. The relevant settings are:
+
+- `LLM_API_KEY` – API key for the LLM provider
+- `LLM_BASE_URL` – full API endpoint URL
+- `LLM_MODEL` – model name to send in the request body
+- `ENABLE_LLM_EXPLAIN` – enables/disables AI interpretation globally (`"true"` or `"false"`)
+- `LLM_TIMEOUT` – request timeout in seconds (default: `45`)
+
+If these values are missing or invalid, the app will fall back to its built-in rule-based interpretation instead of failing completely.
+
+#### Local development
+
+For local development, create a file at:
+
+```bash
+.streamlit/secrets.toml
 ```
+
+Example:
+
+```toml
+LLM_API_KEY = "your-new-api-key"
+LLM_BASE_URL = "https://api.openai.com/v1/chat/completions"
+LLM_MODEL = "gpt-4.1"
+ENABLE_LLM_EXPLAIN = "true"
+LLM_TIMEOUT = "45"
+```
+
+You can also set the same values as environment variables instead of using `secrets.toml`.
+
+**Important:** do not commit `.streamlit/secrets.toml` to Git.
+
+#### Streamlit Community Cloud
+
+For the deployed app, update the same values in:
+
+**App Settings → Secrets**
+
+Paste the same block into the Secrets editor:
+
+```toml
+LLM_API_KEY = "your-new-api-key"
+LLM_BASE_URL = "https://api.openai.com/v1/chat/completions"
+LLM_MODEL = "gpt-4.1"
+ENABLE_LLM_EXPLAIN = "true"
+LLM_TIMEOUT = "45"
+```
+
+After saving, restart or refresh the app and run a simulation to confirm the new key is working.
+
+#### Rotating or changing the API key
+
+To replace the current LLM key:
+
+1. Create a new API key with your preferred provider/account.
+2. Update `LLM_API_KEY` in local `.streamlit/secrets.toml` or in Streamlit Community Cloud Secrets.
+3. Test the app by running a simulation and checking that AI interpretation still appears when enabled.
+4. Revoke the old key after confirming the new one works.
+
+The sidebar toggle **Enable AI interpretation** controls the feature for the current user session, but backend credentials remain admin-managed through secrets.
+
+### 4. Run the app
+
+```bash
 streamlit run app.py
 ```
 
-The app will open in your browser at [http://localhost:8501](http://localhost:8501).
+The app will open in your browser at `http://localhost:8501`.
+
+If AI interpretation is configured, the app will use the external LLM backend. Otherwise, it will use the built-in fallback interpretation.
+
+
+
 
 ## Local development only — External venv (Windows)
 
